@@ -1,13 +1,15 @@
 import numpy as np
 from icecream import ic
-import igl
+import trimesh
 import polyscope as ps
 import closest_neighbour
 
+# Depends on GPU memory
 kMaxQuerySize = 2e9
 
 
-# Exact closest neighbour but limited by cuda memory
+# Approximated closest neighbour (Exact one on subset)
+# TODO: Use point to plane distance
 def closest_neighbour_approx(P, Q):
     Q_max_query_size = int(kMaxQuerySize / len(P))
 
@@ -71,7 +73,7 @@ def icp(P,
         U, S, V_T = np.linalg.svd(cov)
         R = U @ V_T
 
-        # reflection
+        # Reflection
         E = np.ones(len(cov))
         E[-1] = np.sign(np.linalg.det(R))
         R = R * E
@@ -104,13 +106,19 @@ def icp(P,
 
 
 if __name__ == '__main__':
-    VX, FX = igl.read_triangle_mesh('data/mastermodel_3d.obj')
-    VY, FY = igl.read_triangle_mesh('data/scan.ply')
+    # Must pass "process=False" "maintain_order=True" if using trimesh
+    # See: https://github.com/mikedh/trimesh/issues/147
+    template: trimesh.Trimesh = trimesh.load('data/mastermodel_3d.obj',
+                                             process=False,
+                                             maintain_order=True)
+    scan: trimesh.Trimesh = trimesh.load('data/scan.ply',
+                                         process=False,
+                                         maintain_order=True)
 
     # known_correspondences = np.array([[0, 0], [100, 100], [200, 200]])
-    VX, VY = icp(VX, VY)
+    VX, VY = icp(template.vertices, scan.vertices)
 
     ps.init()
-    ps.register_surface_mesh("template", VX, FX)
-    ps.register_surface_mesh("target", VY, FY)
+    ps.register_surface_mesh("template", VX, template.faces)
+    ps.register_surface_mesh("scan", VY, scan.faces)
     ps.show()
