@@ -23,11 +23,17 @@ def closest_neighbour_approx(P, Q):
 
 
 # Reference: https://web.stanford.edu/class/cs273/refs/umeyama.pdf
-def icp(P, Q, matched=None, matched_weight_scale=2, max_iters=10):
+def icp(P,
+        Q,
+        matched=None,
+        matched_weight_scale=2,
+        max_iters=10,
+        reweight=False):
     assert np.linalg.matrix_rank(P) >= P.shape[1] - 1
     assert np.linalg.matrix_rank(Q) >= Q.shape[1] - 1
 
-    threshold_weight = 1
+    reweight_threshold = 5
+    threshold_weight = np.power(reweight_threshold, -0.5) if reweight else 1.
     N = len(P)
     weight = threshold_weight * np.ones(N)
     avg_residual = np.inf
@@ -82,6 +88,11 @@ def icp(P, Q, matched=None, matched_weight_scale=2, max_iters=10):
         P = s * P @ R.T + t
 
         residual = ((P - Q[closest_Q_indices])**2).sum(1)
+
+        # Reweight (Huber loss)
+        if reweight:
+            weight = np.where(residual < reweight_threshold,
+                              np.power(residual, -0.5), threshold_weight)
 
         avg_residual = np.average(residual)
         print(f"Step {i}, avg_residual {avg_residual}")
