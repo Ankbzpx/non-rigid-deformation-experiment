@@ -83,7 +83,7 @@ if __name__ == '__main__':
         torch.zeros(3, device='cuda')[None, None, ...].repeat_interleave(
             verts_template.shape[1], 1))
 
-    optimizer = torch.optim.AdamW([As, ts], lr=1e-4)
+    optimizer = torch.optim.Adam([As, ts], lr=1e-3)
 
     for _ in range(1):
         verts_template = verts_template.requires_grad_(True)
@@ -111,8 +111,7 @@ if __name__ == '__main__':
             J_tr = torch.linalg.matrix_norm(J)**2
             J_det = torch.linalg.det(J)
             #https://app.box.com/s/h6650u6vnxf581hl2rodr3enzf7silex
-            loss_amips = torch.exp(0.125 * (J_tr - 1) + 0.5 *
-                                   (J_det + 1 / J_det)).mean()
+            loss_amips = (J_tr / torch.pow(J_det, 2 / 3)).mean()
 
             loss_laplace = delta_L.matmul(
                 verts_template_transformed).abs().mean()
@@ -126,7 +125,8 @@ if __name__ == '__main__':
             loss_deform = ((verts_template_transformed -
                             verts_template)**2).sum(-1).mean(-1)
 
-            loss = loss_l2 + 0.25 * loss_deform + loss_amips + 1e-2 * loss_normal + 1e-2 * loss_laplace
+            loss = loss_l2 + 0.25 * loss_deform + loss_amips
+            # + 1e-2 * loss_normal + 1e-2 * loss_laplace
 
             print(f"Iteration {i}, Loss {loss.item()}")
 
