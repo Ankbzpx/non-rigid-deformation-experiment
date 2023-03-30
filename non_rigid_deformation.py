@@ -16,31 +16,10 @@ import robust_laplacian
 import scipy.sparse
 from pytorch3d.structures import Meshes
 from pytorch3d.transforms.so3 import so3_exp_map
+import igl
 
 
-def find_icp_verts_corr(vmap_tar,
-                        nmap_tar,
-                        vert_src,
-                        icp_near_size=32,
-                        icp_theta_thresh=np.pi / 6,
-                        icp_dist_thresh=0.05):    # 基于最近邻KD树的关键点寻找
-    src_normals = trimesh.Trimesh(vertices=vert_src,
-                                  faces=source_model.faces,
-                                  process=False).vertex_normals
-    kdtree = scipy.spatial.cKDTree(vmap_tar)    # 用于快速最近邻查找的KD-树
-    dists, indices = kdtree.query(vert_src, k=icp_near_size)
-    tar_normals = nmap_tar[indices.reshape(-1)].reshape(-1, icp_near_size, 3)
-
-    cosine = np.einsum('ijk,ik->ij', tar_normals, src_normals)
-    valid = (dists < icp_dist_thresh) & (cosine > math.cos(icp_theta_thresh))
-
-    valid_indices = np.argmax(valid, axis=1)
-    indices_corr = indices[np.arange(valid.shape[0]), valid_indices]
-    tar_verts = vmap_tar[indices_corr]
-
-    return tar_verts
-
-
+# https://github.com/nmwsharp/diffusion-net/blob/master/src/diffusion_net/utils.py#L50
 def sparse_np_to_torch(A):
     Acoo = A.tocoo()
     values = Acoo.data
@@ -49,6 +28,20 @@ def sparse_np_to_torch(A):
     return torch.sparse.FloatTensor(torch.LongTensor(indices),
                                     torch.FloatTensor(values),
                                     torch.Size(shape)).coalesce()
+
+
+def gradient(y, x, grad_outputs=None):
+    if grad_outputs is None:
+        grad_outputs = torch.ones_like(y)
+    grad = torch.autograd.grad(y, [x],
+                               grad_outputs=grad_outputs,
+                               create_graph=True)[0]
+    return grad
+
+
+def jacobian(output, input):
+    elements = output.split(1, -1)
+    return torch.stack([gradient(ele, input) for ele in elements], -2)
 
 
 if __name__ == '__main__':
@@ -65,7 +58,9 @@ if __name__ == '__main__':
                                                          ...].float().cuda()
     faces_template = torch.from_numpy(template.faces)[None, ...].long().cuda()
 
-    # L, M = robust_laplacian.mesh_laplacian(np.array(template.vertices), np.array(template.faces))
+    # V = np.array(template.vertices)
+    # F = np.array(template.faces)
+    # L, M = robust_laplacian.mesh_laplacian(V, F)
     # M_inv = scipy.sparse.diags(1 / M.diagonal())
     # delta_L = M_inv @ L
     # delta_L = sparse_np_to_torch(delta_L).to_sparse_csr().cuda()
@@ -85,6 +80,8 @@ if __name__ == '__main__':
 
     optimizer = torch.optim.AdamW([log_Rs, ts], lr=1e-3)
 
+    verts_template = verts_template.requires_grad_(True)
+
     for _ in range(1):
         idx = knn_points(verts_template, verts_scan).idx
         verts_scan_closest = knn_gather(verts_scan, idx).squeeze(-2)
@@ -94,6 +91,15 @@ if __name__ == '__main__':
 
             verts_template_transformed = torch.einsum(
                 'bni,nji->bni', verts_template, so3_exp_map(log_Rs)) + ts
+
+            J = jacobian(verts_template_transformed, verts_template)
+
+            J_tr = torch.linalg.matrix_norm(J)**2
+            J_det = torch.linalg.det(J)
+
+            #https://app.box.com/s/h6650u6vnxf581hl2rodr3enzf7silex
+            loss_amips = torch.exp(0.125 * (J_tr - 1) + 0.5 *
+                                   (J_det + 1 / J_det)).mean()
 
             residual = ((verts_template_transformed -
                          verts_scan_closest)**2).sum(-1)
@@ -106,7 +112,7 @@ if __name__ == '__main__':
             loss_chamfer, _ = chamfer_distance(verts_template_transformed,
                                                verts_scan)
 
-            loss = loss_chamfer + loss_laplace
+            loss = loss_amips
 
             print(f"Iteration {i}, Loss {loss.item()}")
 
