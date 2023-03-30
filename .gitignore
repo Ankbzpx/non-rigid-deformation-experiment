@@ -1,2 +1,4 @@
 *.ini
 *.obj
+
+__pycache__
