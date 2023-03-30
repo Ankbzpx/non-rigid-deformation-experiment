@@ -54,9 +54,11 @@ if __name__ == '__main__':
                                          process=False,
                                          maintain_order=True)
 
+    face_adjacency = torch.from_numpy(template.face_adjacency).long().cuda()
+
     verts_template = torch.from_numpy(template.vertices)[None,
                                                          ...].float().cuda()
-    faces_template = torch.from_numpy(template.faces)[None, ...].long().cuda()
+    faces_template = torch.from_numpy(template.faces).long().cuda()
 
     # V = np.array(template.vertices)
     # F = np.array(template.faces)
@@ -65,63 +67,75 @@ if __name__ == '__main__':
     # delta_L = M_inv @ L
     # delta_L = sparse_np_to_torch(delta_L).to_sparse_csr().cuda()
 
-    delta_L = Meshes(verts=verts_template,
-                     faces=faces_template).laplacian_packed().to_sparse_csr()
+    delta_L = Meshes(
+        verts=verts_template,
+        faces=faces_template[None, ...]).laplacian_packed().to_sparse_csr()
 
     verts_scan = torch.from_numpy(scan.vertices)[None, ...].float().cuda()
     faces_scan = torch.from_numpy(scan.faces)[None, ...].long().cuda()
 
-    log_Rs = nn.Parameter(
-        torch.zeros(3, device='cuda')[None, ...].repeat_interleave(
-            verts_template.shape[1], 0))
+    As = nn.Parameter(
+        torch.eye(3,
+                  device='cuda')[None, None,
+                                 ...].repeat_interleave(verts_template.shape[1],
+                                                        1))
     ts = nn.Parameter(
         torch.zeros(3, device='cuda')[None, None, ...].repeat_interleave(
             verts_template.shape[1], 1))
 
-    optimizer = torch.optim.AdamW([log_Rs, ts], lr=1e-3)
-
-    verts_template = verts_template.requires_grad_(True)
+    optimizer = torch.optim.AdamW([As, ts], lr=1e-4)
 
     for _ in range(1):
+        verts_template = verts_template.requires_grad_(True)
+
         idx = knn_points(verts_template, verts_scan).idx
         verts_scan_closest = knn_gather(verts_scan, idx).squeeze(-2)
 
-        for i in range(50):
+        for i in range(100):
             optimizer.zero_grad()
 
-            verts_template_transformed = torch.einsum(
-                'bni,nji->bni', verts_template, so3_exp_map(log_Rs)) + ts
+            verts_template_transformed = torch.einsum('bni,bnji->bni',
+                                                      verts_template, As) + ts
+
+            per_face_verts = verts_template_transformed[0][faces_template]
+            ba = per_face_verts[:, 0, :] - per_face_verts[:, 1, :]
+            ca = per_face_verts[:, 0, :] - per_face_verts[:, 2, :]
+            face_normals = torch.cross(ba, ca)
+            face_normals = face_normals / torch.linalg.norm(
+                face_normals, dim=1, keepdim=True)
+            normal_residual = 1 - (face_normals[face_adjacency[:, 0]] *
+                                   face_normals[face_adjacency[:, 1]]).sum(-1)
+            loss_normal = (normal_residual**2).mean()
 
             J = jacobian(verts_template_transformed, verts_template)
-
             J_tr = torch.linalg.matrix_norm(J)**2
             J_det = torch.linalg.det(J)
-
             #https://app.box.com/s/h6650u6vnxf581hl2rodr3enzf7silex
             loss_amips = torch.exp(0.125 * (J_tr - 1) + 0.5 *
                                    (J_det + 1 / J_det)).mean()
 
-            residual = ((verts_template_transformed -
-                         verts_scan_closest)**2).sum(-1)
-
             loss_laplace = delta_L.matmul(
                 verts_template_transformed).abs().mean()
 
-            loss_l2 = residual.mean()
+            loss_l2 = ((verts_template_transformed -
+                        verts_scan_closest)**2).sum(-1).mean()
 
             loss_chamfer, _ = chamfer_distance(verts_template_transformed,
                                                verts_scan)
 
-            loss = loss_amips
+            loss_deform = ((verts_template_transformed -
+                            verts_template)**2).sum(-1).mean(-1)
+
+            loss = loss_l2 + 0.25 * loss_deform + loss_amips + 1e-2 * loss_normal + 1e-2 * loss_laplace
 
             print(f"Iteration {i}, Loss {loss.item()}")
 
             loss.backward()
             optimizer.step()
 
-        verts_template = torch.einsum('bni,nji->bni', verts_template,
-                                      so3_exp_map(
-                                          log_Rs.detach())) + ts.detach()
+        with torch.no_grad():
+            verts_template = torch.einsum('bni,bnji->bni', verts_template,
+                                          As) + ts
 
         ps.init()
         ps.register_surface_mesh("Before", template.vertices, template.faces)
