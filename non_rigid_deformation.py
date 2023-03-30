@@ -1,22 +1,11 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import pytorch3d.io
 import trimesh
-import scipy, math
-import pickle
-from tqdm import tqdm
-from tqdm import trange
-import pytorch3d.structures as structures
 from pytorch3d.loss import chamfer_distance
-from pytorch3d.ops import knn_points, knn_gather, laplacian
-from icecream import ic
+from pytorch3d.ops import knn_points, knn_gather
 import polyscope as ps
-import robust_laplacian
-import scipy.sparse
 from pytorch3d.structures import Meshes
-from pytorch3d.transforms.so3 import so3_exp_map
-import igl
 
 
 # https://github.com/nmwsharp/diffusion-net/blob/master/src/diffusion_net/utils.py#L50
