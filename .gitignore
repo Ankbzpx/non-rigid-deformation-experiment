@@ -1,5 +1,6 @@
 *.ini
 *.obj
+*.txt
 
 __pycache__
 .vscode

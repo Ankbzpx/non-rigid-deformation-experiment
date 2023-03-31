@@ -1,11 +1,9 @@
 import numpy as np
 import polyscope as ps
-from icecream import ic
-import igl
 import json
-import trimesh
+from icecream import ic
 
-from mesh_helper import read_obj, write_obj
+from mesh_helper import read_obj
 
 if __name__ == '__main__':
 
