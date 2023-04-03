@@ -60,7 +60,7 @@ def sample_color(img, uv, mode='bilinear'):
 
 if __name__ == '__main__':
 
-    template = read_obj('data/mastermodel_3d_aligned.obj')
+    template = read_obj('results/template_icp_match.obj')
 
     per_face_uv = template.uvs[template.face_uvs_idx]
     barycenter_uv = np.average(per_face_uv, 1)
@@ -86,7 +86,7 @@ if __name__ == '__main__':
     template_lms_uv = np.float64(template_lms_data[:, 1:]).astype(object)
     template_lms_data = np.hstack([template_lms_fid, template_lms_uv])
 
-    with open('template_lms.txt', 'w') as f:
+    with open('results/template_icp_match_lms.txt', 'w') as f:
         json.dump(template_lms_data.tolist(), f)
 
-    write_obj('template.obj', template, color_idx)
+    write_obj('results/template_icp_match.obj', template, color_idx)

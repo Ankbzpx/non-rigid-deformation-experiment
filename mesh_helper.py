@@ -1,20 +1,29 @@
-from collections import namedtuple
 import numpy as np
 import os
 from PIL import Image
 import trimesh
+from dataclasses import dataclass
+from icecream import ic
 
-# support vertex color
-return_type = namedtuple('return_type', [
-    'vertices', 'faces', 'faces_quad', 'uvs', 'face_uvs_idx',
-    'face_uvs_idx_quad', 'materials', 'vertex_colors', 'vertex_normals',
-    'polygon_groups', 'extras'
-])
+
+@dataclass
+class Mesh:
+    vertices: np.ndarray
+    faces: np.ndarray
+    vertex_normals: np.ndarray
+    faces_quad: np.ndarray | None
+    uvs: np.ndarray | None
+    face_uvs_idx: np.ndarray | None
+    face_uvs_idx_quad: np.ndarray | None
+    materials: list[Image.Image]
+    vertex_colors: np.ndarray | None
+    polygon_groups: np.ndarray | None
+    extras: list[str]
 
 
 # TODO: Support multiple materials, face normals
 # Modified from https://kaolin.readthedocs.io/en/latest/modules/kaolin.io.obj.html#module-kaolin.io.obj for vertex color support
-def read_obj(path, warning=False):
+def read_obj(path, warning=False) -> Mesh:
     r"""
     Load obj, assume same face size. Support quad mesh, vertex color
     """
@@ -131,13 +140,13 @@ def read_obj(path, warning=False):
     else:
         polygon_groups = None
 
-    return return_type(vertices, faces, faces_quad, uvs, face_uvs_idx,
-                       face_uvs_idx_quad, materials, vertex_colors,
-                       vertex_normals, polygon_groups, extras)
+    return Mesh(vertices, faces, vertex_normals, faces_quad, uvs, face_uvs_idx,
+                face_uvs_idx_quad, materials, vertex_colors, polygon_groups,
+                extras)
 
 
 # TODO: Support multiple materials write, face normal
-def write_obj(filename, mesh: return_type, face_group_id=None):
+def write_obj(filename, mesh: Mesh, face_group_id=None):
     r"""
     Write obj, support quad mesh
     """
@@ -157,6 +166,7 @@ def write_obj(filename, mesh: return_type, face_group_id=None):
             obj_file.write('vt %f %f\n' % (vt[0], vt[1]))
 
         group_counter = 0
+        sort_idx = None
         if face_group_id is not None:
             face_group_id = face_group_id[::2]
             sort_idx = np.argsort(face_group_id)
@@ -174,7 +184,7 @@ def write_obj(filename, mesh: return_type, face_group_id=None):
             polygon_groups = None
 
         if mesh.faces_quad is not None:
-            if polygon_groups is not None:
+            if sort_idx is not None:
                 faces_quad = mesh.faces_quad[sort_idx]
                 face_uvs_idx_quad = mesh.face_uvs_idx_quad[
                     sort_idx] if mesh.face_uvs_idx_quad is not None else None
@@ -201,7 +211,7 @@ def write_obj(filename, mesh: return_type, face_group_id=None):
                     obj_file.write('f %d %d %d %d\n' %
                                    (f[0] + 1, f[1] + 1, f[2] + 1, f[3] + 1))
         else:
-            if polygon_groups is not None:
+            if sort_idx is not None:
                 faces = mesh.faces[sort_idx]
                 face_uvs_idx = mesh.face_uvs_idx[
                     sort_idx] if mesh.face_uvs_idx is not None else None
