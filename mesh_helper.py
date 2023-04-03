@@ -8,7 +8,7 @@ import trimesh
 return_type = namedtuple('return_type', [
     'vertices', 'faces', 'faces_quad', 'uvs', 'face_uvs_idx',
     'face_uvs_idx_quad', 'materials', 'vertex_colors', 'vertex_normals',
-    'extras'
+    'polygon_groups', 'extras'
 ])
 
 
@@ -24,12 +24,15 @@ def read_obj(path, warning=False):
     vertex_normals = []
     vertex_colors = []
     face_uvs_idx = []
+    polygon_groups = []
     mtl_path = None
     materials = []
     extras = []
 
     with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
+        file_lines = f.readlines()
+        for i in range(len(file_lines)):
+            line = file_lines[i]
             data = line.split()
             if len(data) == 0:
                 continue
@@ -48,6 +51,8 @@ def read_obj(path, warning=False):
                     face_uvs_idx.append([int(d[1]) for d in data])
                 else:
                     face_uvs_idx.append([0] * len(data))
+            elif data[0] == 'g':
+                polygon_groups.append(i)
             elif data[0] == 'mtllib':
                 extras.append(line)
                 mtl_path = os.path.join(os.path.dirname(path), data[1])
@@ -119,9 +124,16 @@ def read_obj(path, warning=False):
     else:
         vertex_normals = np.stack(vertex_normals).reshape(-1, 3)
 
+    if len(polygon_groups) != 0:
+        polygon_groups = np.array(polygon_groups)
+        polygon_groups -= polygon_groups[0]
+        polygon_groups -= np.arange(len(polygon_groups))
+    else:
+        polygon_groups = None
+
     return return_type(vertices, faces, faces_quad, uvs, face_uvs_idx,
                        face_uvs_idx_quad, materials, vertex_colors,
-                       vertex_normals, extras)
+                       vertex_normals, polygon_groups, extras)
 
 
 # TODO: Support multiple materials write, face normal
@@ -144,17 +156,25 @@ def write_obj(filename, mesh: return_type, face_group_id=None):
         for vt in mesh.uvs:
             obj_file.write('vt %f %f\n' % (vt[0], vt[1]))
 
-        if mesh.faces_quad is not None:
-            if face_group_id is not None:
-                face_group_id = face_group_id[::2]
-                sort_idx = np.argsort(face_group_id)
-                _, count = np.unique(face_group_id[sort_idx],
-                                     return_counts=True,
-                                     axis=0)
-                polygon_groups = np.cumsum(count)
-                polygon_groups = [0] + list(polygon_groups[:-1])
-                group_counter = 0
+        group_counter = 0
+        if face_group_id is not None:
+            face_group_id = face_group_id[::2]
+            sort_idx = np.argsort(face_group_id)
+            if mesh.faces_quad is None:
+                sort_idx = np.stack([2 * sort_idx, 2 * sort_idx + 1],
+                                    -1).reshape(-1)
+            _, count = np.unique(face_group_id[sort_idx],
+                                 return_counts=True,
+                                 axis=0)
+            polygon_groups = np.cumsum(count)
+            polygon_groups = [0] + list(polygon_groups[:-1])
+        elif mesh.polygon_groups is not None:
+            polygon_groups = mesh.polygon_groups
+        else:
+            polygon_groups = None
 
+        if mesh.faces_quad is not None:
+            if polygon_groups is not None:
                 faces_quad = mesh.faces_quad[sort_idx]
                 face_uvs_idx_quad = mesh.face_uvs_idx_quad[
                     sort_idx] if mesh.face_uvs_idx_quad is not None else None
@@ -163,7 +183,7 @@ def write_obj(filename, mesh: return_type, face_group_id=None):
                 face_uvs_idx_quad = mesh.face_uvs_idx_quad
 
             for i in range(len(faces_quad)):
-                if face_group_id is not None:
+                if polygon_groups is not None:
                     if group_counter < len(
                             polygon_groups
                     ) and i == polygon_groups[group_counter]:
@@ -181,17 +201,7 @@ def write_obj(filename, mesh: return_type, face_group_id=None):
                     obj_file.write('f %d %d %d %d\n' %
                                    (f[0] + 1, f[1] + 1, f[2] + 1, f[3] + 1))
         else:
-            if face_group_id is not None:
-                sort_idx = np.argsort(face_group_id[::2])
-                sort_idx = np.stack([2 * sort_idx, 2 * sort_idx + 1],
-                                    -1).reshape(-1)
-                _, count = np.unique(face_group_id[sort_idx],
-                                     return_counts=True,
-                                     axis=0)
-                polygon_groups = np.cumsum(count)
-                polygon_groups = [0] + list(polygon_groups[:-1])
-                group_counter = 0
-
+            if polygon_groups is not None:
                 faces = mesh.faces[sort_idx]
                 face_uvs_idx = mesh.face_uvs_idx[
                     sort_idx] if mesh.face_uvs_idx is not None else None
@@ -200,7 +210,7 @@ def write_obj(filename, mesh: return_type, face_group_id=None):
                 face_uvs_idx = mesh.face_uvs_idx
 
             for i in range(len(faces)):
-                if face_group_id is not None:
+                if polygon_groups is not None:
                     if group_counter < len(
                             polygon_groups
                     ) and i == polygon_groups[group_counter]:
