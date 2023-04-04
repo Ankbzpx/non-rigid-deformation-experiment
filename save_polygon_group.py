@@ -65,13 +65,14 @@ if __name__ == '__main__':
     per_face_uv = template.uvs[template.face_uvs_idx]
     barycenter_uv = np.average(per_face_uv, 1)
 
-    facial_sheet = np.array(Image.open('data/FacialSheet_yellow.png')) / 255.
+    facial_sheet = np.array(Image.open('data/FacialSheet_modified.png')) / 255.
     uv_color = sample_color(facial_sheet, barycenter_uv, mode='nearest')
 
     unique_color, unique_counts = np.unique(uv_color,
                                             return_counts=True,
                                             axis=0)
     unique_color = unique_color[unique_counts > 10]
+    ic(len(unique_color))
 
     color_idx = np.argmin(cdist(uv_color, unique_color), 1)
 
@@ -81,7 +82,7 @@ if __name__ == '__main__':
     template_lms_data = np.array(json.load(open('data/mastermodel_3d.txt')))
     template_lms_fid = np.int64(template_lms_data[:, 0])
     template_lms_fid = np.array([
-        np.argwhere(sort_idx == lms_fid) for lms_fid in template_lms_fid
+        np.where(sort_idx == lms_fid) for lms_fid in template_lms_fid
     ]).flatten()[:, None]
     template_lms_uv = np.float64(template_lms_data[:, 1:]).astype(object)
     template_lms_data = np.hstack([template_lms_fid, template_lms_uv])

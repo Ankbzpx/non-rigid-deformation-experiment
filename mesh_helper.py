@@ -4,10 +4,11 @@ from PIL import Image
 import trimesh
 from dataclasses import dataclass
 from icecream import ic
+import json
 
 
 @dataclass
-class Mesh:
+class OBJMesh:
     vertices: np.ndarray
     faces: np.ndarray
     vertex_normals: np.ndarray
@@ -18,12 +19,13 @@ class Mesh:
     materials: list[Image.Image]
     vertex_colors: np.ndarray | None
     polygon_groups: np.ndarray | None
+    polygon_groups_quad: np.ndarray | None
     extras: list[str]
 
 
 # TODO: Support multiple materials, face normals
 # Modified from https://kaolin.readthedocs.io/en/latest/modules/kaolin.io.obj.html#module-kaolin.io.obj for vertex color support
-def read_obj(path, warning=False) -> Mesh:
+def read_obj(path, warning=False) -> OBJMesh:
     r"""
     Load obj, assume same face size. Support quad mesh, vertex color
     """
@@ -102,6 +104,13 @@ def read_obj(path, warning=False) -> Mesh:
 
     faces = np.int64(faces) - 1
 
+    if len(polygon_groups) != 0:
+        polygon_groups = np.array(polygon_groups)
+        polygon_groups -= polygon_groups[0]
+        polygon_groups -= np.arange(len(polygon_groups))
+    else:
+        polygon_groups = None
+
     faces_quad = None
     face_uvs_idx_quad = None
     face_size = faces.shape[1]
@@ -118,6 +127,9 @@ def read_obj(path, warning=False) -> Mesh:
                            [face_uv_idx[0], face_uv_idx[2], face_uv_idx[3]]])
                 for face_uv_idx in face_uvs_idx_quad
             ])
+        if polygon_groups is not None:
+            polygon_groups_quad = polygon_groups
+            polygon_groups = 2 * polygon_groups_quad
 
     if len(vertex_normals) == 0 or len(vertex_normals) != len(vertices):
         if warning:
@@ -133,20 +145,13 @@ def read_obj(path, warning=False) -> Mesh:
     else:
         vertex_normals = np.stack(vertex_normals).reshape(-1, 3)
 
-    if len(polygon_groups) != 0:
-        polygon_groups = np.array(polygon_groups)
-        polygon_groups -= polygon_groups[0]
-        polygon_groups -= np.arange(len(polygon_groups))
-    else:
-        polygon_groups = None
-
-    return Mesh(vertices, faces, vertex_normals, faces_quad, uvs, face_uvs_idx,
-                face_uvs_idx_quad, materials, vertex_colors, polygon_groups,
-                extras)
+    return OBJMesh(vertices, faces, vertex_normals, faces_quad, uvs,
+                   face_uvs_idx, face_uvs_idx_quad, materials, vertex_colors,
+                   polygon_groups, polygon_groups_quad, extras)
 
 
 # TODO: Support multiple materials write, face normal
-def write_obj(filename, mesh: Mesh, face_group_id=None):
+def write_obj(filename, mesh: OBJMesh, face_group_id=None):
     r"""
     Write obj, support quad mesh
     """
@@ -179,7 +184,10 @@ def write_obj(filename, mesh: Mesh, face_group_id=None):
             polygon_groups = np.cumsum(count)
             polygon_groups = [0] + list(polygon_groups[:-1])
         elif mesh.polygon_groups is not None:
-            polygon_groups = mesh.polygon_groups
+            if mesh.faces_quad is None:
+                polygon_groups = mesh.polygon_groups
+            else:
+                polygon_groups = mesh.polygon_groups_quad
         else:
             polygon_groups = None
 
@@ -236,3 +244,19 @@ def write_obj(filename, mesh: Mesh, face_group_id=None):
                     obj_file.write('f %d/%d %d/%d %d/%d\n' %
                                    (f[0] + 1, f_uv[0] + 1, f[1] + 1,
                                     f_uv[1] + 1, f[2] + 1, f_uv[2] + 1))
+
+
+# https://docs.r3ds.com/Wrap/Nodes/SelectPoints/SelectPoints.html
+def load_face_landmarks(mesh, json_path) -> np.ndarray:
+    lms_data = np.array(json.load(open(json_path)))
+    lms_fid = np.int64(lms_data[:, 0])
+    lms_uv = np.float64(lms_data[:, 1:])
+
+    per_landmark_face_verts = mesh.vertices[mesh.faces[lms_fid]]
+    A = per_landmark_face_verts[:, 0, :]
+    B = per_landmark_face_verts[:, 1, :]
+    C = per_landmark_face_verts[:, 2, :]
+
+    lms = C + (A - C) * lms_uv[:, 0][:, None] + (B - C) * lms_uv[:, 1][:, None]
+
+    return lms
