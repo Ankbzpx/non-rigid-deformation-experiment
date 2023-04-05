@@ -68,6 +68,11 @@ if __name__ == '__main__':
     A_diag = scipy.sparse.spdiags(A_sum.squeeze(-1), 0, NV, NV)
     laplacian_uniform = A - A_diag
 
+    # edge info
+    L_coo = scipy.sparse.coo_array(L)
+    edges = np.stack([L_coo.row, L_coo.col], -1)
+    edge_weights = L_coo.data
+
     # Annoyingly lms are NOT vetices, so use incident triangle vertices instead
     lm_tri_verts_indice = np.unique(F[lms_fid])
 
@@ -80,8 +85,6 @@ if __name__ == '__main__':
     # If load using trimesh, the internal processing would cause landmark mismatch
     template_tri = trimesh.Trimesh(V, F)
     face_adjacency = np.copy(template_tri.face_adjacency)
-    # TODO: assign different weights to different edges
-    edges = np.copy(template_tri.edges)
 
     handle_indices = np.load('results/bi.npy')
     weights = np.load('results/bbw.npy')
@@ -96,6 +99,7 @@ if __name__ == '__main__':
     faces = torch.from_numpy(F).long().cuda()
     face_adjacency = torch.from_numpy(face_adjacency).long().cuda()
     edges = torch.from_numpy(edges).long().cuda()
+    edge_weights = torch.from_numpy(edge_weights).float().cuda()
 
     handle_indices = torch.from_numpy(handle_indices).long().cuda()
     weights = sparse_np_to_torch(weights).cuda()
@@ -111,12 +115,15 @@ if __name__ == '__main__':
 
     # adj_lists = [torch.tensor(adj_list).long().cuda() for adj_list in adj_lists]
     # weight_lists = [torch.tensor(weight_list).float().cuda() for weight_list in weight_lists]
+    log_Rs = nn.Parameter(
+        torch.zeros(3, device='cuda')[None,
+                                      ...].repeat_interleave(verts.shape[0], 0))
 
     delta_t = nn.Parameter(
         torch.zeros(3, device='cuda')[None, ...].repeat_interleave(
             len(handle_indices), 0))
 
-    optimizer = torch.optim.Adam([delta_t], lr=1e-3)
+    optimizer = torch.optim.Adam([log_Rs, delta_t], lr=1e-3)
     verts_deformed = verts
 
     for _ in range(20):
@@ -124,8 +131,7 @@ if __name__ == '__main__':
         dists = knn.dists
         idx = knn.idx
 
-        # 1 x n x 1
-        mask_robust = dists < 5e-4
+        mask_robust = dists < dists.mean()
         idx_robust = idx[mask_robust][None, ..., None]
         verts_scan_closest = knn_gather(verts_scan[None, ...],
                                         idx_robust).squeeze(-2).squeeze(0)
@@ -133,7 +139,10 @@ if __name__ == '__main__':
         for iter in range(100):
             optimizer.zero_grad()
 
-            verts_transformed = weights @ delta_t + verts
+            per_vertex_R = so3_exp_map(log_Rs)
+
+            verts_transformed = weights @ delta_t + torch.einsum(
+                'ni,nji->ni', verts, per_vertex_R)
 
             loss_closest = (
                 (verts_scan_closest -
@@ -160,7 +169,16 @@ if __name__ == '__main__':
                                    face_normals[face_adjacency[:, 1]]).sum(-1)
             loss_normal = (normal_residual**2).mean()
 
-            loss = 0.5 * loss_closest + loss_lms + 1e-2 * loss_normal + 1e-1 * loss_laplace
+            e_0 = edges[:, 0]
+            e_1 = edges[:, 1]
+            edge_vec = verts[e_0] - verts[e_1]
+            edge_vec_transformed = verts_transformed[e_0] - verts_transformed[
+                e_1]
+            edge_R = 0.5 * (per_vertex_R[e_0] + per_vertex_R[e_1])
+            deform_residual = (edge_vec_transformed -
+                               torch.einsum('ni,nji->ni', edge_vec, edge_R))**2
+            loss_arap = (edge_weights * deform_residual.sum(-1)).mean()
+            loss = 0.5 * loss_closest + loss_lms + 1e2 * loss_arap
 
             print(f"Iteration {iter}, Loss {loss.item()}")
 
@@ -168,7 +186,8 @@ if __name__ == '__main__':
             optimizer.step()
 
         with torch.no_grad():
-            verts_deformed = weights @ delta_t.detach() + verts
+            verts_deformed = weights @ delta_t.detach() + torch.einsum(
+                'ni,nji->ni', verts, so3_exp_map(log_Rs.detach()))
 
     knn = knn_points(verts_deformed[None, ...], verts_scan[None, ...])
     dists = knn.dists
