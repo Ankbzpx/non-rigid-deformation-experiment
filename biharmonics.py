@@ -53,8 +53,9 @@ if __name__ == '__main__':
     # 13: right eye
     boundary_indices, exlude_indices_list, exlude_control_indices = get_group_boundary(
         template, exlude=[3, 10, 13])
-
     np.save('results/bi.npy', boundary_indices)
+    exclude_indices = np.unique(np.concatenate(exlude_indices_list))
+    np.save('results/ei.npy', exclude_indices)
 
     # boundary condition
     b = np.concatenate([boundary_indices] + exlude_indices_list)
