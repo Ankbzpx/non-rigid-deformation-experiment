@@ -11,7 +11,9 @@ if __name__ == '__main__':
     template_lms = load_face_landmarks(template,
                                        'results/template_icp_match_lms.txt')
 
-    scan: trimesh.Trimesh = trimesh.load('data/scan.ply')
+    scan: trimesh.Trimesh = trimesh.load('data/scan.ply',
+                                         process=False,
+                                         maintain_order=True)
     scan_lms_data = json.load(open('data/scan_3d.txt'))
     scan_lms = np.stack(
         [np.array([lm['x'], lm['y'], lm['z']]) for lm in scan_lms_data])
