@@ -56,6 +56,20 @@ if __name__ == '__main__':
     NV = len(V)
     NF = len(F)
 
+    F1, F2, F3 = igl.local_basis(V, F)
+    scale = 1 / np.sqrt(igl.doublearea(V, F))
+    F1 = F1 * scale[:, None]
+    F2 = F2 * scale[:, None]
+
+    A = V[F[:, 0]]
+    B = V[F[:, 1]]
+    C = V[F[:, 2]]
+    e1 = B - A
+    e2 = C - A
+    e1_uv = np.stack([(e1 * F1).sum(-1), (e1 * F2).sum(-1)], -1)
+    e2_uv = np.stack([(e2 * F1).sum(-1), (e2 * F2).sum(-1)], -1)
+    E = np.stack([e1_uv, e2_uv], -1)
+
     # Cotangent laplacian
     L = igl.cotmatrix(V, F)
     M = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_BARYCENTRIC)
@@ -76,12 +90,6 @@ if __name__ == '__main__':
     # Annoyingly lms are NOT vetices, so use incident triangle vertices instead
     lm_tri_verts_indice = np.unique(F[lms_fid])
 
-    # adj_lists = igl.adjacency_list(F)
-    # weight_lists = []
-    # for i in range(NV):
-    #     weight_list = [L[i, adj_idx] for adj_idx in adj_lists[i]]
-    #     weight_lists.append(weight_list)
-
     # If load using trimesh, the internal processing would cause landmark mismatch
     template_tri = trimesh.Trimesh(V, F)
     face_adjacency = np.copy(template_tri.face_adjacency)
@@ -95,11 +103,19 @@ if __name__ == '__main__':
     exclude_indices = np.load('results/ei.npy')
 
     # to torch
+    valid_mask = torch.ones(len(V))
+    valid_mask[exclude_indices] = 0
+    valid_mask = valid_mask.cuda().float()
+
     verts = torch.from_numpy(V).float().cuda()
     faces = torch.from_numpy(F).long().cuda()
     face_adjacency = torch.from_numpy(face_adjacency).long().cuda()
     edges = torch.from_numpy(edges).long().cuda()
     edge_weights = torch.from_numpy(edge_weights).float().cuda()
+
+    F1 = torch.from_numpy(F1).float().cuda()
+    F2 = torch.from_numpy(F2).float().cuda()
+    E_inv = torch.linalg.inv(torch.from_numpy(E).float().cuda())
 
     handle_indices = torch.from_numpy(handle_indices).long().cuda()
     weights = sparse_np_to_torch(weights).cuda()
@@ -112,9 +128,30 @@ if __name__ == '__main__':
     lms_uv = torch.from_numpy(lms_uv).float().cuda()
     scan_lms = torch.from_numpy(scan_lms).float().cuda()
     verts_scan = torch.from_numpy(scan.vertices).float().cuda()
+    vertex_normals_scan = torch.from_numpy(np.copy(
+        scan.vertex_normals)).float().cuda()
 
-    # adj_lists = [torch.tensor(adj_list).long().cuda() for adj_list in adj_lists]
-    # weight_lists = [torch.tensor(weight_list).float().cuda() for weight_list in weight_lists]
+    def closest_neighbour(points, thr=5e-4):
+        candidates_idx = knn_points(points[None, ...],
+                                    verts_scan[None, ...],
+                                    K=32).idx
+        closest_candidates = knn_gather(verts_scan[None, ...], candidates_idx)
+        closest_candidate_normals = knn_gather(vertex_normals_scan[None, ...],
+                                               candidates_idx)
+
+        dists = torch.einsum('bncd,bncd->bnc',
+                             points[None, :, None, :] - closest_candidates,
+                             closest_candidate_normals).abs()
+        closest_dist, closest_idx = torch.min(dists, dim=-1, keepdim=True)
+        closest_idx = torch.gather(candidates_idx, -1, closest_idx)
+
+        mask_robust = closest_dist < thr
+        idx_robust = closest_idx[mask_robust][None, ..., None]
+        verts_scan_closest = knn_gather(verts_scan[None, ...],
+                                        idx_robust).squeeze(-2).squeeze(0)
+
+        return mask_robust, verts_scan_closest
+
     log_Rs = nn.Parameter(
         torch.zeros(3, device='cuda')[None,
                                       ...].repeat_interleave(verts.shape[0], 0))
@@ -123,18 +160,12 @@ if __name__ == '__main__':
         torch.zeros(3, device='cuda')[None, ...].repeat_interleave(
             len(handle_indices), 0))
 
-    optimizer = torch.optim.Adam([log_Rs, delta_t], lr=1e-3)
+    optimizer = torch.optim.Adam([log_Rs, delta_t], lr=1e-4)
     verts_deformed = verts
 
-    for _ in range(20):
-        knn = knn_points(verts_deformed[None, ...], verts_scan[None, ...])
-        dists = knn.dists
-        idx = knn.idx
-
-        mask_robust = dists < dists.mean()
-        idx_robust = idx[mask_robust][None, ..., None]
-        verts_scan_closest = knn_gather(verts_scan[None, ...],
-                                        idx_robust).squeeze(-2).squeeze(0)
+    for _ in range(1):
+        mask_robust, verts_scan_closest = closest_neighbour(
+            verts_deformed, 5e-4)
 
         for iter in range(100):
             optimizer.zero_grad()
@@ -174,31 +205,40 @@ if __name__ == '__main__':
             edge_vec = verts[e_0] - verts[e_1]
             edge_vec_transformed = verts_transformed[e_0] - verts_transformed[
                 e_1]
-            edge_R = 0.5 * (per_vertex_R[e_0] + per_vertex_R[e_1])
+            edge_R = per_vertex_R[e_0]
             deform_residual = (edge_vec_transformed -
                                torch.einsum('ni,nji->ni', edge_vec, edge_R))**2
             loss_arap = (edge_weights * deform_residual.sum(-1)).mean()
+
+            A = verts_transformed[faces[:, 0]]
+            B = verts_transformed[faces[:, 1]]
+            C = verts_transformed[faces[:, 2]]
+            e1 = B - A
+            e2 = C - A
+            e1_uv = torch.stack([(e1 * F1).sum(-1), (e1 * F2).sum(-1)], -1)
+            e2_uv = torch.stack([(e2 * F1).sum(-1), (e2 * F2).sum(-1)], -1)
+            E = torch.stack([e1_uv, e2_uv], -1)
+
+            J = torch.bmm(E, E_inv)
+            J_tr = torch.linalg.matrix_norm(J)**2
+            J_det = torch.linalg.det(J)
+            #https://app.box.com/s/h6650u6vnxf581hl2rodr3enzf7silex
+            pos_det = (J_det >= 0.0).float()
+            loss_amips = ((J_tr / (J_det + 1e-6) - 2).abs() * pos_det).mean()
+
             loss = 0.5 * loss_closest + loss_lms + 1e2 * loss_arap
 
             print(f"Iteration {iter}, Loss {loss.item()}")
 
             loss.backward()
+            log_Rs.grad *= valid_mask[:, None]
             optimizer.step()
 
         with torch.no_grad():
             verts_deformed = weights @ delta_t.detach() + torch.einsum(
                 'ni,nji->ni', verts, so3_exp_map(log_Rs.detach()))
 
-    knn = knn_points(verts_deformed[None, ...], verts_scan[None, ...])
-    dists = knn.dists
-    idx = knn.idx
-    ic(dists.median())
-    ic(dists.mean())
-    mask_robust = dists < 5e-4
-    idx_robust = idx[mask_robust][None, ..., None]
-    verts_scan_closest = knn_gather(verts_scan[None, ...],
-                                    idx_robust).squeeze(-2).squeeze(0)
-
+    mask_robust, verts_scan_closest = closest_neighbour(verts_deformed)
     verts_deformed = verts_deformed.detach().cpu().numpy()
 
     b = np.where(mask_robust[0, :, 0].detach().cpu().numpy())[0]
@@ -217,13 +257,16 @@ if __name__ == '__main__':
     verts_arap = arap.solve(bc, verts_deformed)
 
     ps.init()
-    ps.register_surface_mesh("Original", template.vertices, template.faces)
+    ps.register_surface_mesh("Original",
+                             template.vertices,
+                             template.faces,
+                             enabled=False)
     ps.register_surface_mesh("Deformed", verts_deformed, template.faces)
-    ps.register_surface_mesh("ARAP", verts_arap, template.faces)
-    ps.register_surface_mesh("Scan", scan.vertices, scan.faces)
+    ps.register_surface_mesh("ARAP", verts_arap, template.faces, enabled=False)
+    # ps.register_surface_mesh("Scan", scan.vertices, scan.faces)
     ps.show()
 
-    template.vertices = verts_deformed
-    write_obj('results/nicp.obj', template)
-    template.vertices = verts_arap
-    write_obj('results/arap.obj', template)
+    # template.vertices = verts_deformed
+    # write_obj('results/nicp.obj', template)
+    # template.vertices = verts_arap
+    # write_obj('results/arap.obj', template)
