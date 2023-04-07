@@ -237,13 +237,13 @@ def write_obj(filename, mesh: OBJMesh, face_group_id=None):
 
                 f = faces[i]
                 if face_uvs_idx is not None:
-                    obj_file.write('f %d %d %d\n' %
-                                   (f[0] + 1, f[1] + 1, f[2] + 1))
-                else:
                     f_uv = face_uvs_idx[i]
                     obj_file.write('f %d/%d %d/%d %d/%d\n' %
                                    (f[0] + 1, f_uv[0] + 1, f[1] + 1,
                                     f_uv[1] + 1, f[2] + 1, f_uv[2] + 1))
+                else:
+                    obj_file.write('f %d %d %d\n' %
+                                   (f[0] + 1, f[1] + 1, f[2] + 1))
 
 
 # https://docs.r3ds.com/Wrap/Nodes/SelectPoints/SelectPoints.html
