@@ -113,6 +113,7 @@ def read_obj(path, warning=False) -> OBJMesh:
 
     faces_quad = None
     face_uvs_idx_quad = None
+    polygon_groups_quad = None
     face_size = faces.shape[1]
     if face_size == 4:
         faces_quad = faces
@@ -173,11 +174,14 @@ def write_obj(filename, mesh: OBJMesh, face_group_id=None):
         group_counter = 0
         sort_idx = None
         if face_group_id is not None:
-            face_group_id = face_group_id[::2]
-            sort_idx = np.argsort(face_group_id)
             if mesh.faces_quad is None:
-                sort_idx = np.stack([2 * sort_idx, 2 * sort_idx + 1],
-                                    -1).reshape(-1)
+                face_idx_all = np.arange(len(face_group_id))
+                sort_idx = np.concatenate([
+                    face_idx_all[face_group_id == id]
+                    for id in np.arange(face_group_id.max() + 1)
+                ])
+            else:
+                sort_idx = np.argsort(face_group_id[::2])
             _, count = np.unique(face_group_id[sort_idx],
                                  return_counts=True,
                                  axis=0)
