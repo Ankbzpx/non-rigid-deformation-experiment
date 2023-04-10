@@ -1,0 +1,3 @@
+[submodule "VectorAdam"]
+	path = VectorAdam
+	url = https://github.com/iszihan/VectorAdam.git
