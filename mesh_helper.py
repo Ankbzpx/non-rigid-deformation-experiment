@@ -181,7 +181,8 @@ def write_obj(filename, mesh: OBJMesh, face_group_id=None):
                     for id in np.arange(face_group_id.max() + 1)
                 ])
             else:
-                sort_idx = np.argsort(face_group_id[::2])
+                face_group_id = face_group_id[::2]
+                sort_idx = np.argsort(face_group_id)
             _, count = np.unique(face_group_id[sort_idx],
                                  return_counts=True,
                                  axis=0)
