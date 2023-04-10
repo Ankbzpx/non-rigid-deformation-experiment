@@ -145,6 +145,7 @@ if __name__ == '__main__':
     face_adj_pairs = np.vstack([face_adj_pairs, diag_pairs])
     face_adj_weight = np.concatenate([face_adj_weight, diag_weight])
 
+    F_weight = scipy.sparse.spdiags(igl.doublearea(V, F), 0, NF, NF)
     F_adj = scipy.sparse.coo_array(
         (face_adj_weight, (face_adj_pairs[:, 0], face_adj_pairs[:, 1])),
         shape=(NF, NF)).tocsc()
@@ -170,6 +171,7 @@ if __name__ == '__main__':
     laplacian_uniform = sparse_np_to_torch(laplacian_uniform).cuda()
     L = sparse_np_to_torch(L).cuda()
     F_adj = sparse_np_to_torch(F_adj).to_sparse_csr().cuda()
+    F_weight = sparse_np_to_torch(F_weight).to_sparse_csr().cuda()
     # F_adj_quad = sparse_np_to_torch(F_adj_quad).to_sparse_csr().cuda()
 
     lms_fid = torch.from_numpy(lms_fid).long().cuda()
@@ -178,6 +180,7 @@ if __name__ == '__main__':
     verts_scan = torch.from_numpy(scan.vertices).float().cuda()
     vertex_normals_scan = torch.from_numpy(np.copy(
         scan.vertex_normals)).float().cuda()
+    I = torch.eye(3).float().cuda()
 
     def closest_neighbour(points, thr=5e-4):
         candidates_idx = knn_points(points[None, ...],
@@ -212,12 +215,22 @@ if __name__ == '__main__':
     optimizer = VectorAdam([delta_t], lr=1e-3)
 
     verts_deformed = verts
-    weight_close = 0.5
-    weight_lms = 1.0
-    weight_amips = 1.0
-    weight_smooth = 1e-3
 
-    for _ in range(1):
+    weight_close = 0
+    weight_lms = 1.0
+    weight_amips = 1e3
+    weight_identity = 0.5
+    weight_smooth = 1e1
+
+    for iter in range(5):
+        if iter == 0:
+            weight_close = 0
+        else:
+            if weight_close == 0:
+                weight_close = 5e-2
+            else:
+                weight_close *= 2
+
         mask_robust, verts_scan_closest = closest_neighbour(
             verts_deformed, 5e-4)
 
@@ -280,13 +293,19 @@ if __name__ == '__main__':
             J_det = torch.linalg.det(J)
             # https://app.box.com/s/h6650u6vnxf581hl2rodr3enzf7silex
             pos_det = (J_det >= 0.0).float()
-            loss_amips = ((J_tr * (1e-6 + torch.pow(J_det, -2 / 3)) - 3) *
+            loss_amips = (F_weight @ (J_tr /
+                                      (1e-6 + torch.pow(J_det, 2 / 3)) - 3) *
                           pos_det).sum() / pos_det.sum()
 
             # one ring smooth of deformation gradient
-            loss_smooth = (F_adj @ J.reshape(-1, 9)).sum(-1).abs().mean()
+            loss_smooth = (
+                F_weight @ F_adj @ J.reshape(-1, 9)).sum(-1).abs().mean()
 
-            loss = weight_close * loss_closest + weight_lms * loss_lms + weight_amips * loss_amips + weight_smooth * loss_smooth
+            # deformation gradient to be identity
+            loss_identity = (F_weight @ (J - I[None, ...]).reshape(
+                -1, 9)).sum(-1).abs().mean()
+
+            loss = weight_close * loss_closest + weight_lms * loss_lms + weight_amips * loss_amips + weight_identity * loss_identity + weight_smooth * loss_smooth
 
             print(f"Iteration {iter}, Loss {loss.item()}")
 
@@ -303,7 +322,7 @@ if __name__ == '__main__':
     verts_deformed = verts_deformed.detach().cpu().numpy()
 
     b = np.where(mask_robust[0, :, 0].detach().cpu().numpy())[0]
-    bc = verts_scan_closest.detach().cpu().numpy()
+    bc = verts_deformed[mask_robust[0, :, 0].detach().cpu().numpy()]
 
     # b = lm_tri_verts_indice
     # bc = verts_deformed[lm_tri_verts_indice]
@@ -324,10 +343,10 @@ if __name__ == '__main__':
                              enabled=False)
     ps.register_surface_mesh("Deformed", verts_deformed, template.faces)
     ps.register_surface_mesh("ARAP", verts_arap, template.faces, enabled=False)
-    # ps.register_surface_mesh("Scan", scan.vertices, scan.faces)
+    ps.register_surface_mesh("Scan", scan.vertices, scan.faces)
     ps.show()
 
     template.vertices = verts_deformed
     write_obj('results/nicp.obj', template)
-    # template.vertices = verts_arap
-    # write_obj('results/arap.obj', template)
+    template.vertices = verts_arap
+    write_obj('results/arap.obj', template)
