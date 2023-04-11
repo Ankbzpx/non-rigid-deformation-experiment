@@ -12,6 +12,7 @@ from pytorch3d.ops import knn_points, knn_gather
 from pytorch3d.transforms.so3 import so3_exp_map
 from VectorAdam.vectoradam import VectorAdam
 from torch.optim import Adam
+from pytorch3d import _C
 
 
 # https://github.com/nmwsharp/diffusion-net/blob/master/src/diffusion_net/utils.py#L50
@@ -65,7 +66,7 @@ if __name__ == '__main__':
     lms_fid = np.int64(lms_data[:, 0])
     lms_uv = np.float64(lms_data[:, 1:])
 
-    scan: trimesh.Trimesh = trimesh.load('data/scan.ply',
+    scan: trimesh.Trimesh = trimesh.load('data/scan_decimated.obj',
                                          process=False,
                                          maintain_order=True)
     scan_lms_data = json.load(open('data/scan_3d.txt'))
@@ -160,6 +161,11 @@ if __name__ == '__main__':
     face_adjacency = torch.from_numpy(face_adjacency).long().cuda()
     edges = torch.from_numpy(edges).long().cuda()
     edge_weights = torch.from_numpy(edge_weights).float().cuda()
+    VF, NI = igl.vertex_triangle_adjacency(F, NV)
+    vert_face_adjacency = [
+        torch.from_numpy(vf_indices).long().cuda()
+        for vf_indices in np.split(VF, NI[1:-1])
+    ]
 
     W = compute_edge_vec(verts, faces)
     W_inv = torch.linalg.inv(W)
@@ -177,31 +183,44 @@ if __name__ == '__main__':
     lms_fid = torch.from_numpy(lms_fid).long().cuda()
     lms_uv = torch.from_numpy(lms_uv).float().cuda()
     scan_lms = torch.from_numpy(scan_lms).float().cuda()
-    verts_scan = torch.from_numpy(scan.vertices).float().cuda()
-    vertex_normals_scan = torch.from_numpy(np.copy(
-        scan.vertex_normals)).float().cuda()
+    per_face_verts_scan = torch.from_numpy(
+        scan.vertices[scan.faces]).float().cuda()
+    face_normals_scan = torch.from_numpy(np.copy(
+        scan.face_normals)).float().cuda()
     I = torch.eye(3).float().cuda()
 
-    def closest_neighbour(points, thr=5e-4):
-        candidates_idx = knn_points(points[None, ...],
-                                    verts_scan[None, ...],
-                                    K=32).idx
-        closest_candidates = knn_gather(verts_scan[None, ...], candidates_idx)
-        closest_candidate_normals = knn_gather(vertex_normals_scan[None, ...],
-                                               candidates_idx)
+    # point_face_dist_forward
+    first_idx = torch.tensor([0]).long().cuda()
+    max_points = NV
+    min_triangle_area = 5e-3
 
-        dists = torch.einsum('bncd,bncd->bnc',
-                             points[None, :, None, :] - closest_candidates,
-                             closest_candidate_normals).abs()
-        closest_dist, closest_idx = torch.min(dists, dim=-1, keepdim=True)
-        closest_idx = torch.gather(candidates_idx, -1, closest_idx)
+    def uniform_vert_normals(vertices: torch.Tensor) -> torch.Tensor:
+        per_face_verts = vertices[faces]
+        face_normals = torch.cross(per_face_verts[:, 1] - per_face_verts[:, 0],
+                                   per_face_verts[:, 2] - per_face_verts[:, 0],
+                                   dim=-1)
+        face_normals = face_normals / torch.linalg.norm(
+            face_normals, dim=-1, keepdims=True)
+        return torch.stack([
+            face_normals[vf_idx].mean(dim=0) for vf_idx in vert_face_adjacency
+        ])
 
-        mask_robust = closest_dist < thr
-        idx_robust = closest_idx[mask_robust][None, ..., None]
-        verts_scan_closest = knn_gather(verts_scan[None, ...],
-                                        idx_robust).squeeze(-2).squeeze(0)
+    def closest_neighbour(points: torch.Tensor, thr=5e-4) -> list[torch.Tensor]:
+        dists, indices = _C.point_face_dist_forward(points, first_idx,
+                                                    per_face_verts_scan,
+                                                    first_idx, max_points,
+                                                    min_triangle_area)
+        vert_normals = uniform_vert_normals(points)
+        cos = torch.einsum('ab,ab->a', face_normals_scan[indices], vert_normals)
+        valid_match = torch.logical_and(dists < thr, cos > 0)
 
-        return mask_robust, verts_scan_closest
+        # https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.104.4264&rep=rep1&type=pdf
+        pts = points[valid_match]
+        tris = per_face_verts_scan[indices[valid_match]]
+        tri_normals = face_normals_scan[indices[valid_match]]
+        pt_proj = pts - torch.einsum('ab,ab->a', pts - tris[:, 0, :],
+                                     tri_normals)[..., None] * tri_normals
+        return valid_match, pt_proj
 
     # log_Rs = nn.Parameter(
     #     torch.zeros(3, device='cuda')[None,
@@ -231,8 +250,7 @@ if __name__ == '__main__':
             else:
                 weight_close *= 2
 
-        mask_robust, verts_scan_closest = closest_neighbour(
-            verts_deformed, 5e-4)
+        mask_robust, verts_scan_closest = closest_neighbour(verts_deformed)
 
         for iter in range(100):
             optimizer.zero_grad()
@@ -244,9 +262,8 @@ if __name__ == '__main__':
 
             verts_deformed = weights @ delta_t + verts
 
-            loss_closest = (
-                (verts_scan_closest -
-                 verts_deformed[mask_robust[0, :, 0]])**2).sum(1).mean()
+            loss_closest = ((verts_scan_closest -
+                             verts_deformed[mask_robust])**2).sum(1).mean()
 
             per_landmark_face_verts = verts_deformed[faces[lms_fid]]
             A = per_landmark_face_verts[:, 0, :]
@@ -321,8 +338,8 @@ if __name__ == '__main__':
     mask_robust, verts_scan_closest = closest_neighbour(verts_deformed)
     verts_deformed = verts_deformed.detach().cpu().numpy()
 
-    b = np.where(mask_robust[0, :, 0].detach().cpu().numpy())[0]
-    bc = verts_deformed[mask_robust[0, :, 0].detach().cpu().numpy()]
+    b = np.where(mask_robust.detach().cpu().numpy())[0]
+    bc = verts_deformed[mask_robust.detach().cpu().numpy()]
 
     # b = lm_tri_verts_indice
     # bc = verts_deformed[lm_tri_verts_indice]
@@ -346,7 +363,7 @@ if __name__ == '__main__':
     ps.register_surface_mesh("Scan", scan.vertices, scan.faces)
     ps.show()
 
-    template.vertices = verts_deformed
-    write_obj('results/nicp.obj', template)
-    template.vertices = verts_arap
-    write_obj('results/arap.obj', template)
+    # template.vertices = verts_deformed
+    # write_obj('results/nicp.obj', template)
+    # template.vertices = verts_arap
+    # write_obj('results/arap.obj', template)

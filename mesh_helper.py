@@ -135,12 +135,13 @@ def read_obj(path, warning=False) -> OBJMesh:
     if len(vertex_normals) == 0 or len(vertex_normals) != len(vertices):
         if warning:
             print("Obj doesn't contain vertex_normals, compute using trimesh")
-        vertex_normals = trimesh.Trimesh(
-            vertices=vertices,
-            faces=faces,
-            process=False,
-            maintain_order=True,
-        ).vertex_normals
+        vertex_normals = np.copy(
+            trimesh.Trimesh(
+                vertices=vertices,
+                faces=faces,
+                process=False,
+                maintain_order=True,
+            ).vertex_normals)
         assert not np.isnan(vertex_normals).any()
         assert len(vertex_normals) == len(vertices)
     else:
