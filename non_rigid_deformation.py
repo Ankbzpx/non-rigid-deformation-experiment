@@ -155,6 +155,7 @@ if __name__ == '__main__':
     valid_mask = torch.ones(len(V))
     valid_mask[exclude_indices] = 0
     valid_mask = valid_mask.cuda().float()
+    exclude_indices_torch = torch.from_numpy(exclude_indices).cuda().long()
 
     verts = torch.from_numpy(V).float().cuda()
     faces = torch.from_numpy(F).long().cuda()
@@ -205,14 +206,17 @@ if __name__ == '__main__':
             face_normals[vf_idx].mean(dim=0) for vf_idx in vert_face_adjacency
         ])
 
-    def closest_neighbour(points: torch.Tensor, thr=5e-4) -> list[torch.Tensor]:
+    def closest_neighbour(points: torch.Tensor,
+                          dist_thr=5e-4,
+                          cos_thr=0.0) -> list[torch.Tensor]:
         dists, indices = _C.point_face_dist_forward(points, first_idx,
                                                     per_face_verts_scan,
                                                     first_idx, max_points,
                                                     min_triangle_area)
         vert_normals = uniform_vert_normals(points)
         cos = torch.einsum('ab,ab->a', face_normals_scan[indices], vert_normals)
-        valid_match = torch.logical_and(dists < thr, cos > 0)
+        valid_match = torch.logical_and(dists < dist_thr, cos > cos_thr)
+        valid_match[exclude_indices_torch] = False
 
         # https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.104.4264&rep=rep1&type=pdf
         pts = points[valid_match]
@@ -246,11 +250,13 @@ if __name__ == '__main__':
             weight_close = 0
         else:
             if weight_close == 0:
-                weight_close = 5e-2
+                weight_close = 5e-1
             else:
                 weight_close *= 2
+                weight_close = min(weight_close, 5e1)
 
-        mask_robust, verts_scan_closest = closest_neighbour(verts_deformed)
+        mask_robust, verts_scan_closest = closest_neighbour(verts_deformed,
+                                                            cos_thr=0.5)
 
         for iter in range(100):
             optimizer.zero_grad()
@@ -335,11 +341,12 @@ if __name__ == '__main__':
             #     'ni,nji->ni', verts, so3_exp_map(log_Rs.detach()))
             verts_deformed = weights @ delta_t.detach() + verts
 
-    mask_robust, verts_scan_closest = closest_neighbour(verts_deformed)
+    mask_robust, verts_scan_closest = closest_neighbour(verts_deformed, 5e-4,
+                                                        0.9)
     verts_deformed = verts_deformed.detach().cpu().numpy()
 
     b = np.where(mask_robust.detach().cpu().numpy())[0]
-    bc = verts_deformed[mask_robust.detach().cpu().numpy()]
+    bc = verts_scan_closest.detach().cpu().numpy()
 
     # b = lm_tri_verts_indice
     # bc = verts_deformed[lm_tri_verts_indice]
@@ -360,10 +367,11 @@ if __name__ == '__main__':
                              enabled=False)
     ps.register_surface_mesh("Deformed", verts_deformed, template.faces)
     ps.register_surface_mesh("ARAP", verts_arap, template.faces, enabled=False)
-    ps.register_surface_mesh("Scan", scan.vertices, scan.faces)
+    ps.register_surface_mesh("Scan", scan.vertices, scan.faces, enabled=False)
+    ps.register_point_cloud("Boundary", bc, enabled=False)
     ps.show()
 
-    # template.vertices = verts_deformed
-    # write_obj('results/nicp.obj', template)
-    # template.vertices = verts_arap
-    # write_obj('results/arap.obj', template)
+    template.vertices = verts_deformed
+    write_obj('results/nicp.obj', template)
+    template.vertices = verts_arap
+    write_obj('results/arap.obj', template)
