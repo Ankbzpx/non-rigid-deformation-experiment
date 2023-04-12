@@ -17,9 +17,11 @@ def match_correspondence(pc_float_lms, pc_fixed_lms):
     R = U @ V_T
 
     # Reflection
-    E = np.ones(len(cov))
-    E[-1] = np.sign(np.linalg.det(R))
-    R = R * E
+    if np.linalg.det(R) < 0:
+        E = np.eye(len(cov))
+        min_idx = np.argmin(S)
+        E[min_idx, min_idx] = -1
+        R = U @ E @ V_T
 
     demo = np.sum(P_bar * P_bar) / len(pc_float_lms)
 

@@ -3,7 +3,6 @@ import os
 from PIL import Image
 import trimesh
 from dataclasses import dataclass
-from icecream import ic
 import json
 
 
