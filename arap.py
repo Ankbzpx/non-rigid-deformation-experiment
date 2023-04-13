@@ -46,7 +46,7 @@ def boundary_condition(V, b_vid):
     return C, b_mask
 
 
-class VertsLinearSolver:
+class LinearVertexSolver:
 
     def __init__(self,
                  C_upper: scipy.sparse.spmatrix,
@@ -77,7 +77,7 @@ class VertsLinearSolver:
         assert self.NBC == len(BC)
 
 
-class BiLaplacian(VertsLinearSolver):
+class BiLaplacian(LinearVertexSolver):
 
     def __init__(self,
                  V: np.ndarray,
@@ -100,7 +100,7 @@ class BiLaplacian(VertsLinearSolver):
         return self.solve_factorized(self.C_T @ B)
 
 
-class AsRigidAsPossible(VertsLinearSolver):
+class AsRigidAsPossible(LinearVertexSolver):
 
     def __init__(self,
                  V: np.ndarray,

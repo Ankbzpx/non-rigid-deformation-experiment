@@ -8,10 +8,9 @@ import json
 import igl
 from icecream import ic
 import scipy
-from pytorch3d.ops import knn_points, knn_gather
-from pytorch3d.transforms.so3 import so3_exp_map
+# from pytorch3d.transforms.so3 import so3_exp_map
 from VectorAdam.vectoradam import VectorAdam
-from torch.optim import Adam
+# from torch.optim import Adam
 from pytorch3d import _C
 
 
@@ -26,21 +25,8 @@ def sparse_np_to_torch(A) -> torch.Tensor:
                                     torch.Size(shape)).coalesce()
 
 
-def gradient(y, x, grad_outputs=None) -> list[torch.Tensor]:
-    if grad_outputs is None:
-        grad_outputs = torch.ones_like(y)
-    grad = torch.autograd.grad(y, [x],
-                               grad_outputs=grad_outputs,
-                               create_graph=True)[0]
-    return grad
-
-
-def jacobian(output, input) -> torch.Tensor:
-    elements = output.split(1, -1)
-    return torch.stack([gradient(ele, input) for ele in elements], -2)
-
-
-def compute_edge_vec(verts: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
+def compute_deformation(verts: torch.Tensor,
+                        faces: torch.Tensor) -> torch.Tensor:
     per_face_verts = verts[faces]
     v1 = per_face_verts[:, 0]
     v2 = per_face_verts[:, 1]
@@ -96,9 +82,6 @@ if __name__ == '__main__':
     edges = np.stack([L_coo.row, L_coo.col], -1)
     edge_weights = L_coo.data
 
-    # Annoyingly lms are NOT vetices, so use incident triangle vertices instead
-    lm_tri_verts_indice = np.unique(F[lms_fid])
-
     # If load using trimesh, the internal processing would cause landmark mismatch
     template_tri = trimesh.Trimesh(V, F)
     face_adjacency = np.copy(template_tri.face_adjacency)
@@ -111,11 +94,11 @@ if __name__ == '__main__':
     weights = scipy.sparse.csr_matrix(weights)
     exclude_indices = np.load('results/ei.npy')
 
-    Ti = np.arange(NF, dtype=np.int64)
-    diag_pairs = np.stack([Ti, Ti], -1)
+    f_ids = np.arange(NF, dtype=np.int64)
+    diag_pairs = np.stack([f_ids, f_ids], -1)
 
     # quad adjacency constraint
-    # face_adj_quad_pairs = np.vstack([np.stack([Ti[::2], Ti[1::2]], -1), np.stack([Ti[1::2], Ti[::2]], -1)])
+    # face_adj_quad_pairs = np.vstack([np.stack([f_ids[::2], f_ids[1::2]], -1), np.stack([f_ids[1::2], f_ids[::2]], -1)])
     # face_adj_quad_weight = np.ones(len(face_adj_quad_pairs))
 
     # face_adj_quad_pairs = np.vstack([face_adj_quad_pairs, diag_pairs])
@@ -130,9 +113,9 @@ if __name__ == '__main__':
     TT = igl.triangle_triangle_adjacency(F)[0]
 
     face_adj_pairs = np.vstack([
-        np.stack([Ti, TT[:, 0]], -1),
-        np.stack([Ti, TT[:, 1]], -1),
-        np.stack([Ti, TT[:, 2]], -1)
+        np.stack([f_ids, TT[:, 0]], -1),
+        np.stack([f_ids, TT[:, 1]], -1),
+        np.stack([f_ids, TT[:, 2]], -1)
     ])
     boundary_indices = np.sum(face_adj_pairs == -1, 1) != 0
     boundary_face_indices = np.unique(face_adj_pairs[:, 0][boundary_indices])
@@ -168,7 +151,7 @@ if __name__ == '__main__':
         for vf_indices in np.split(VF, NI[1:-1])
     ]
 
-    W = compute_edge_vec(verts, faces)
+    W = compute_deformation(verts, faces)
     W_inv = torch.linalg.inv(W)
 
     handle_indices = torch.from_numpy(handle_indices).long().cuda()
@@ -188,7 +171,7 @@ if __name__ == '__main__':
         scan.vertices[scan.faces]).float().cuda()
     face_normals_scan = torch.from_numpy(np.copy(
         scan.face_normals)).float().cuda()
-    I = torch.eye(3).float().cuda()
+    J_I = torch.eye(3).float().cuda()
 
     # point_face_dist_forward
     first_idx = torch.tensor([0]).long().cuda()
@@ -215,16 +198,16 @@ if __name__ == '__main__':
                                                     min_triangle_area)
         vert_normals = uniform_vert_normals(points)
         cos = torch.einsum('ab,ab->a', face_normals_scan[indices], vert_normals)
-        valid_match = torch.logical_and(dists < dist_thr, cos > cos_thr)
-        valid_match[exclude_indices_torch] = False
+        valid_mask = torch.logical_and(dists < dist_thr, cos > cos_thr)
+        valid_mask[exclude_indices_torch] = False
 
         # https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.104.4264&rep=rep1&type=pdf
-        pts = points[valid_match]
-        tris = per_face_verts_scan[indices[valid_match]]
-        tri_normals = face_normals_scan[indices[valid_match]]
+        pts = points[valid_mask]
+        tris = per_face_verts_scan[indices[valid_mask]]
+        tri_normals = face_normals_scan[indices[valid_mask]]
         pt_proj = pts - torch.einsum('ab,ab->a', pts - tris[:, 0, :],
                                      tri_normals)[..., None] * tri_normals
-        return valid_match, pt_proj
+        return valid_mask, pt_proj
 
     # log_Rs = nn.Parameter(
     #     torch.zeros(3, device='cuda')[None,
@@ -255,8 +238,8 @@ if __name__ == '__main__':
                 weight_close *= 2
                 weight_close = min(weight_close, 5e1)
 
-        mask_robust, verts_scan_closest = closest_neighbour(verts_deformed,
-                                                            cos_thr=0.5)
+        valid_mask, verts_scan_closest = closest_neighbour(verts_deformed,
+                                                           cos_thr=0.5)
 
         for iter in range(100):
             optimizer.zero_grad()
@@ -269,7 +252,7 @@ if __name__ == '__main__':
             verts_deformed = weights @ delta_t + verts
 
             loss_closest = ((verts_scan_closest -
-                             verts_deformed[mask_robust])**2).sum(1).mean()
+                             verts_deformed[valid_mask])**2).sum(1).mean()
 
             per_landmark_face_verts = verts_deformed[faces[lms_fid]]
             A = per_landmark_face_verts[:, 0, :]
@@ -279,7 +262,7 @@ if __name__ == '__main__':
                 B - C) * lms_uv[:, 1][:, None]
             loss_lms = ((scan_lms - lms)**2).sum(1).mean()
 
-            loss_laplace = laplacian_cot.matmul(verts_deformed).abs().mean()
+            # loss_laplace = laplacian_cot.matmul(verts_deformed).abs().mean()
 
             # per_face_verts = verts_deformed[faces]
             # ba = per_face_verts[:, 0, :] - per_face_verts[:, 1, :]
@@ -301,16 +284,8 @@ if __name__ == '__main__':
             #                    torch.einsum('ni,nji->ni', edge_vec, edge_R))**2
             # loss_arap = (edge_weights * deform_residual.sum(-1)).mean()
 
-            # A = verts_deformed[faces[:, 0]]
-            # B = verts_deformed[faces[:, 1]]
-            # C = verts_deformed[faces[:, 2]]
-            # e1 = B - A
-            # e2 = C - A
-            # e1_uv = torch.stack([(e1 * F1).sum(-1), (e1 * F2).sum(-1)], -1)
-            # e2_uv = torch.stack([(e2 * F1).sum(-1), (e2 * F2).sum(-1)], -1)
-            # E = torch.stack([e1_uv, e2_uv], -1)
-
-            W_deformed = compute_edge_vec(verts_deformed, faces)
+            W_deformed = compute_deformation(verts_deformed, faces)
+            # deformation gradient
             J = torch.bmm(W_deformed, W_inv)
             J_tr = torch.linalg.matrix_norm(J)**2
             J_det = torch.linalg.det(J)
@@ -325,10 +300,12 @@ if __name__ == '__main__':
                 F_weight @ F_adj @ J.reshape(-1, 9)).sum(-1).abs().mean()
 
             # deformation gradient to be identity
-            loss_identity = (F_weight @ (J - I[None, ...]).reshape(
+            loss_identity = (F_weight @ (J - J_I[None, ...]).reshape(
                 -1, 9)).sum(-1).abs().mean()
 
-            loss = weight_close * loss_closest + weight_lms * loss_lms + weight_amips * loss_amips + weight_identity * loss_identity + weight_smooth * loss_smooth
+            loss = (weight_close * loss_closest) + (weight_lms * loss_lms) + (
+                weight_amips * loss_amips) + (weight_identity * loss_identity
+                                             ) + (weight_smooth * loss_smooth)
 
             print(f"Iteration {iter}, Loss {loss.item()}")
 
@@ -341,37 +318,34 @@ if __name__ == '__main__':
             #     'ni,nji->ni', verts, so3_exp_map(log_Rs.detach()))
             verts_deformed = weights @ delta_t.detach() + verts
 
-    mask_robust, verts_scan_closest = closest_neighbour(verts_deformed, 5e-4,
-                                                        0.9)
-    verts_deformed = verts_deformed.detach().cpu().numpy()
+    valid_mask, verts_scan_closest = closest_neighbour(verts_deformed, 5e-4,
+                                                       0.9)
+    V_deformed = verts_deformed.detach().cpu().numpy()
 
-    b = np.where(mask_robust.detach().cpu().numpy())[0]
-    bc = verts_scan_closest.detach().cpu().numpy()
+    B = np.where(valid_mask.detach().cpu().numpy())[0]
+    BC = verts_scan_closest.detach().cpu().numpy()
 
-    # b = lm_tri_verts_indice
-    # bc = verts_deformed[lm_tri_verts_indice]
+    B = np.concatenate([exclude_indices, B])
+    BC = np.concatenate([V_deformed[exclude_indices], BC])
 
-    b = np.concatenate([exclude_indices, b])
-    bc = np.concatenate([verts_deformed[exclude_indices], bc])
+    B, b_idx = np.unique(B, return_index=True)
+    BC = BC[b_idx]
 
-    b, b_idx = np.unique(b, return_index=True)
-    bc = bc[b_idx]
-
-    arap = igl.ARAP(V, F, 3, b)
-    verts_arap = arap.solve(bc, verts_deformed)
+    arap = igl.ARAP(V, F, 3, B)
+    V_arap = arap.solve(BC, V_deformed)
 
     ps.init()
     ps.register_surface_mesh("Original",
                              template.vertices,
                              template.faces,
                              enabled=False)
-    ps.register_surface_mesh("Deformed", verts_deformed, template.faces)
-    ps.register_surface_mesh("ARAP", verts_arap, template.faces, enabled=False)
+    ps.register_surface_mesh("Deformed", V_deformed, template.faces)
+    ps.register_surface_mesh("ARAP", V_arap, template.faces, enabled=False)
     ps.register_surface_mesh("Scan", scan.vertices, scan.faces, enabled=False)
-    ps.register_point_cloud("Boundary", bc, enabled=False)
+    ps.register_point_cloud("Boundary", BC, enabled=False)
     ps.show()
 
-    template.vertices = verts_deformed
-    write_obj('results/nicp.obj', template)
-    template.vertices = verts_arap
-    write_obj('results/arap.obj', template)
+    # template.vertices = V_deformed
+    # write_obj('results/nicp.obj', template)
+    # template.vertices = verts_arap
+    # write_obj('results/arap.obj', template)
