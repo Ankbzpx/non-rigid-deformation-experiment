@@ -69,7 +69,7 @@ class VertsLinearSolver:
         C = scipy.sparse.vstack([C_upper[b_mask]] + C_lower)
 
         self.b_mask = b_mask
-        self.NBC = NV - np.sum(b_mask)
+        self.NBC = C.shape[0] - np.sum(b_mask)
         self.C_T = C.T
         self.solve_factorized = scipy.sparse.linalg.factorized(C.T @ C)
 
@@ -174,35 +174,48 @@ if __name__ == '__main__':
 
     V = bar.vertices
     F = bar.faces
+    per_face_vertex = V[F]
 
     NV = len(V)
+    NF = len(F)
     v_ids = np.arange(NV)
     handle_ids_0 = bar.vertices[:, 2] > 95
     handle_ids_1 = bar.vertices[:, 2] < 28
 
-    # boundary indices
-    boundary_ids = np.concatenate([v_ids[handle_ids_0], v_ids[handle_ids_1]])
+    handle_ids_0_f_mask = np.sum((per_face_vertex[..., 2] < 28), 1) == 3
+    handle_ids_1_f_mask = np.sum((per_face_vertex[..., 2] > 95), 1) == 3
+
+    f_ids = np.arange(NF)
+    boundary_fid = np.concatenate(
+        [f_ids[handle_ids_0_f_mask], f_ids[handle_ids_1_f_mask]])
+    bary_coords = np.vstack([
+        np.ones((np.sum(handle_ids_0_f_mask), 3)),
+        np.ones((np.sum(handle_ids_1_f_mask), 3))
+    ]) / 3
+
+    BC = (per_face_vertex[boundary_fid] * bary_coords[..., None]).sum(1)
 
     # deformation transformation
     R_deform = Rotation.from_rotvec(np.array([0, 0, 2 * np.pi / 3])).as_matrix()
     t_deform = np.array([0, -10, -10])
 
-    V_deform = np.copy(V)
-    V_deform[handle_ids_1] = V_deform[handle_ids_1] @ R_deform.T + t_deform
+    BC_split = np.sum(handle_ids_0_f_mask)
+    BC[BC_split:] = BC[BC_split:] @ R_deform.T + t_deform
 
-    bilaplacian = BiLaplacian(V, F, boundary_ids)
-    V_init = bilaplacian.solve(V_deform[boundary_ids])
+    bilaplacian = BiLaplacian(V,
+                              F,
+                              b_fid=boundary_fid,
+                              b_bary_coords=bary_coords)
+    V_init = bilaplacian.solve(BC)
 
-    arap = AsRigidAsPossible(V, F, boundary_ids)
-    V_arap = arap.solve(V_init[boundary_ids], V_init)
-
-    arap_igl = igl.ARAP(V, F, 3, boundary_ids)
-    V_arap_igl = arap_igl.solve(V_init[boundary_ids], V_init)
+    arap = AsRigidAsPossible(V,
+                             F,
+                             b_fid=boundary_fid,
+                             b_bary_coords=bary_coords)
+    V_arap = arap.solve(BC, V_init)
 
     ps.init()
     ps.register_surface_mesh('bar', V, F, enabled=False)
-    ps.register_surface_mesh('bar_deform', V_deform, F, enabled=False)
     ps.register_surface_mesh('bar_init', V_init, F, enabled=False)
     ps.register_surface_mesh('bar_arap', V_arap, F)
-    ps.register_surface_mesh('bar_arap_igl', V_arap_igl, F, enabled=False)
     ps.show()
