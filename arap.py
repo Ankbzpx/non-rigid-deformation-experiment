@@ -53,18 +53,22 @@ class LinearVertexSolver:
                  V: np.ndarray,
                  F: np.ndarray,
                  b_vid: np.ndarray | None = None,
+                 b_v_bounded=True,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None,
+                 b_f_bounded=True):
         C_lower = []
         b_mask = np.ones(len(V)).astype(bool)
         if b_vid is not None:
             C_v, b_v = boundary_condition(V, b_vid)
             C_lower.append(C_v)
-            b_mask = np.logical_and(b_mask, b_v)
+            if b_v_bounded:
+                b_mask = np.logical_and(b_mask, b_v)
         if b_fid is not None:
             C_f, b_f = boundary_condition_bary(V, F, b_fid, b_bary_coords)
             C_lower.append(C_f)
-            b_mask = np.logical_and(b_mask, b_f)
+            if b_f_bounded:
+                b_mask = np.logical_and(b_mask, b_f)
 
         C = scipy.sparse.vstack([C_upper[b_mask]] + C_lower)
 
@@ -83,15 +87,18 @@ class BiLaplacian(LinearVertexSolver):
                  V: np.ndarray,
                  F: np.ndarray,
                  b_vid: np.ndarray | None = None,
+                 b_v_bounded=True,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None,
+                 b_f_bounded=True):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Hybrid voronoi that guarantees positive area
         M: scipy.sparse.csc_matrix = igl.massmatrix(V, F,
                                                     igl.MASSMATRIX_TYPE_VORONOI)
         M_inv = scipy.sparse.diags(1 / M.diagonal())
         C_upper = L @ M_inv @ L
-        super().__init__(C_upper, V, F, b_vid, b_fid, b_bary_coords)
+        super().__init__(C_upper, V, F, b_vid, b_v_bounded, b_fid,
+                         b_bary_coords, b_f_bounded)
         self.B_upper = np.zeros((np.sum(self.b_mask), 3))
 
     def solve(self, BC: np.ndarray):
@@ -106,12 +113,15 @@ class AsRigidAsPossible(LinearVertexSolver):
                  V: np.ndarray,
                  F: np.ndarray,
                  b_vid: np.ndarray | None = None,
+                 b_v_bounded=True,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None,
+                 b_f_bounded=True):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Negative diagonal
         C_upper = -L
-        super().__init__(C_upper, V, F, b_vid, b_fid, b_bary_coords)
+        super().__init__(C_upper, V, F, b_vid, b_v_bounded, b_fid,
+                         b_bary_coords, b_f_bounded)
 
         V_cot_adj_coo = scipy.sparse.coo_array(L)
         valid_entries_mask = V_cot_adj_coo.col != V_cot_adj_coo.row
