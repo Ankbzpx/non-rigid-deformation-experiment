@@ -60,7 +60,7 @@ def uniform_vert_normals(
         [face_normals[vf_idx].mean(dim=0) for vf_idx in vert_face_adjacency])
 
 
-def closest_point_triangle_dists(verts: torch.Tensor,
+def closest_point_triangle_match(verts: torch.Tensor,
                                  faces: torch.Tensor,
                                  vert_face_adjacency: list[torch.Tensor],
                                  target_per_face_verts: torch.Tensor,
@@ -228,12 +228,12 @@ if __name__ == '__main__':
     #     return torch.stack([
     #         face_normals[vf_idx].mean(dim=0) for vf_idx in vert_face_adjacency
     #     ])
-    closest_neighbour = partial(closest_point_triangle_dists,
-                                faces=faces,
-                                vert_face_adjacency=vert_face_adjacency,
-                                target_per_face_verts=per_face_verts_scan,
-                                target_vertex_normals=face_normals_scan,
-                                exclude_indices=exclude_indices_torch)
+    closest_match = partial(closest_point_triangle_match,
+                            faces=faces,
+                            vert_face_adjacency=vert_face_adjacency,
+                            target_per_face_verts=per_face_verts_scan,
+                            target_vertex_normals=face_normals_scan,
+                            exclude_indices=exclude_indices_torch)
 
     # log_Rs = nn.Parameter(
     #     torch.zeros(3, device='cuda')[None,
@@ -264,8 +264,8 @@ if __name__ == '__main__':
                 weight_close *= 2
                 weight_close = min(weight_close, 5e1)
 
-        valid_mask, verts_scan_closest = closest_neighbour(verts_deformed,
-                                                           cos_thr=0.5)
+        valid_mask, verts_scan_closest = closest_match(verts_deformed,
+                                                       cos_thr=0.5)
 
         for iter in range(100):
             optimizer.zero_grad()
@@ -344,9 +344,9 @@ if __name__ == '__main__':
             #     'ni,nji->ni', verts, so3_exp_map(log_Rs.detach()))
             verts_deformed = weights @ delta_t.detach() + verts
 
-    valid_mask, verts_scan_closest = closest_neighbour(verts_deformed,
-                                                       dist_thr=5e-4,
-                                                       cos_thr=0.9)
+    valid_mask, verts_scan_closest = closest_match(verts_deformed,
+                                                   dist_thr=5e-4,
+                                                   cos_thr=0.9)
     V_deformed = verts_deformed.detach().cpu().numpy()
 
     B = np.where(valid_mask.detach().cpu().numpy())[0]
