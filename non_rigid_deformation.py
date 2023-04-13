@@ -12,6 +12,7 @@ import scipy
 from VectorAdam.vectoradam import VectorAdam
 # from torch.optim import Adam
 from pytorch3d import _C
+from functools import partial
 
 
 # https://github.com/nmwsharp/diffusion-net/blob/master/src/diffusion_net/utils.py#L50
@@ -44,6 +45,48 @@ def compute_deformation(verts: torch.Tensor,
     e3 = v4 - v1
 
     return torch.stack([e1, e2, e3], -1)
+
+
+def uniform_vert_normals(
+        vertices: torch.Tensor, faces: torch.Tensor,
+        vert_face_adjacency: list[torch.Tensor]) -> torch.Tensor:
+    per_face_verts = vertices[faces]
+    face_normals = torch.cross(per_face_verts[:, 1] - per_face_verts[:, 0],
+                               per_face_verts[:, 2] - per_face_verts[:, 0],
+                               dim=-1)
+    face_normals = face_normals / torch.linalg.norm(
+        face_normals, dim=-1, keepdims=True)
+    return torch.stack(
+        [face_normals[vf_idx].mean(dim=0) for vf_idx in vert_face_adjacency])
+
+
+def closest_point_triangle_dists(verts: torch.Tensor,
+                                 faces: torch.Tensor,
+                                 vert_face_adjacency: list[torch.Tensor],
+                                 target_per_face_verts: torch.Tensor,
+                                 target_vertex_normals: torch.Tensor,
+                                 exclude_indices: torch.Tensor,
+                                 dist_thr=5e-4,
+                                 cos_thr=0.0,
+                                 min_triangle_area=5e-3) -> list[torch.Tensor]:
+    max_points = len(verts)
+    first_idx = torch.tensor([0], device=verts.device).long()
+    dists, indices = _C.point_face_dist_forward(verts, first_idx,
+                                                target_per_face_verts,
+                                                first_idx, max_points,
+                                                min_triangle_area)
+    vert_normals = uniform_vert_normals(verts, faces, vert_face_adjacency)
+    cos = torch.einsum('ab,ab->a', target_vertex_normals[indices], vert_normals)
+    valid_mask = torch.logical_and(dists < dist_thr, cos > cos_thr)
+    valid_mask[exclude_indices] = False
+
+    # https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.104.4264&rep=rep1&type=pdf
+    pts = verts[valid_mask]
+    tris = target_per_face_verts[indices[valid_mask]]
+    tri_normals = target_vertex_normals[indices[valid_mask]]
+    pt_proj = pts - torch.einsum('ab,ab->a', pts - tris[:, 0, :],
+                                 tri_normals)[..., None] * tri_normals
+    return valid_mask, pt_proj
 
 
 if __name__ == '__main__':
@@ -174,40 +217,23 @@ if __name__ == '__main__':
     J_I = torch.eye(3).float().cuda()
 
     # point_face_dist_forward
-    first_idx = torch.tensor([0]).long().cuda()
-    max_points = NV
-    min_triangle_area = 5e-3
 
-    def uniform_vert_normals(vertices: torch.Tensor) -> torch.Tensor:
-        per_face_verts = vertices[faces]
-        face_normals = torch.cross(per_face_verts[:, 1] - per_face_verts[:, 0],
-                                   per_face_verts[:, 2] - per_face_verts[:, 0],
-                                   dim=-1)
-        face_normals = face_normals / torch.linalg.norm(
-            face_normals, dim=-1, keepdims=True)
-        return torch.stack([
-            face_normals[vf_idx].mean(dim=0) for vf_idx in vert_face_adjacency
-        ])
-
-    def closest_neighbour(points: torch.Tensor,
-                          dist_thr=5e-4,
-                          cos_thr=0.0) -> list[torch.Tensor]:
-        dists, indices = _C.point_face_dist_forward(points, first_idx,
-                                                    per_face_verts_scan,
-                                                    first_idx, max_points,
-                                                    min_triangle_area)
-        vert_normals = uniform_vert_normals(points)
-        cos = torch.einsum('ab,ab->a', face_normals_scan[indices], vert_normals)
-        valid_mask = torch.logical_and(dists < dist_thr, cos > cos_thr)
-        valid_mask[exclude_indices_torch] = False
-
-        # https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.104.4264&rep=rep1&type=pdf
-        pts = points[valid_mask]
-        tris = per_face_verts_scan[indices[valid_mask]]
-        tri_normals = face_normals_scan[indices[valid_mask]]
-        pt_proj = pts - torch.einsum('ab,ab->a', pts - tris[:, 0, :],
-                                     tri_normals)[..., None] * tri_normals
-        return valid_mask, pt_proj
+    # def uniform_vert_normals(vertices: torch.Tensor) -> torch.Tensor:
+    #     per_face_verts = vertices[faces]
+    #     face_normals = torch.cross(per_face_verts[:, 1] - per_face_verts[:, 0],
+    #                                per_face_verts[:, 2] - per_face_verts[:, 0],
+    #                                dim=-1)
+    #     face_normals = face_normals / torch.linalg.norm(
+    #         face_normals, dim=-1, keepdims=True)
+    #     return torch.stack([
+    #         face_normals[vf_idx].mean(dim=0) for vf_idx in vert_face_adjacency
+    #     ])
+    closest_neighbour = partial(closest_point_triangle_dists,
+                                faces=faces,
+                                vert_face_adjacency=vert_face_adjacency,
+                                target_per_face_verts=per_face_verts_scan,
+                                target_vertex_normals=face_normals_scan,
+                                exclude_indices=exclude_indices_torch)
 
     # log_Rs = nn.Parameter(
     #     torch.zeros(3, device='cuda')[None,
@@ -318,8 +344,9 @@ if __name__ == '__main__':
             #     'ni,nji->ni', verts, so3_exp_map(log_Rs.detach()))
             verts_deformed = weights @ delta_t.detach() + verts
 
-    valid_mask, verts_scan_closest = closest_neighbour(verts_deformed, 5e-4,
-                                                       0.9)
+    valid_mask, verts_scan_closest = closest_neighbour(verts_deformed,
+                                                       dist_thr=5e-4,
+                                                       cos_thr=0.9)
     V_deformed = verts_deformed.detach().cpu().numpy()
 
     B = np.where(valid_mask.detach().cpu().numpy())[0]
