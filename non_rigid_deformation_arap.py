@@ -7,7 +7,7 @@ import json
 from mesh_helper import read_obj, write_obj
 from arap import AsRigidAsPossible
 import torch
-from non_rigid_deformation import closest_point_triangle_match
+from non_rigid_deformation import closest_point_triangle_match, closest_point_on_triangle
 import trimesh
 from functools import partial
 from tqdm import tqdm
@@ -47,6 +47,15 @@ if __name__ == '__main__':
     scan_lms = np.stack(
         [np.array([lm['x'], lm['y'], lm['z']]) for lm in scan_lms_data])
 
+    per_face_verts_scan = torch.from_numpy(
+        scan.vertices[scan.faces]).float().cuda()
+    face_normals_scan = torch.from_numpy(np.copy(
+        scan.face_normals)).float().cuda()
+
+    scan_lms = closest_point_on_triangle(
+        torch.from_numpy(scan_lms).float().cuda(), per_face_verts_scan,
+        face_normals_scan)[0].detach().cpu().numpy()
+
     arap = AsRigidAsPossible(V,
                              F,
                              b_fid=lms_fid,
@@ -54,9 +63,19 @@ if __name__ == '__main__':
                              b_f_bounded=False)
     V_arap = arap.solve(scan_lms, V)
 
+    # template_lms = (V[F[lms_fid]] * lms_bary_coords[..., None]).sum(1)
+    # template_lms_arap = (V_arap[F[lms_fid]] * lms_bary_coords[..., None]).sum(1)
+
     # ps.init()
-    # ps.register_surface_mesh("template", V, F)
+    # ps.register_surface_mesh("template", V, F, enabled=False)
     # ps.register_surface_mesh("template_arap", V_arap, F)
+    # ps.register_surface_mesh("scan", scan.vertices, scan.faces)
+    # ps.register_point_cloud("template_lms",
+    #                         template_lms,
+    #                         radius=2e-3,
+    #                         enabled=False)
+    # ps.register_point_cloud("template_lms_arap", template_lms_arap, radius=2e-3)
+    # ps.register_point_cloud("scan_lms", scan_lms, radius=2e-3)
     # ps.show()
 
     # template.vertices = V_arap
@@ -68,10 +87,6 @@ if __name__ == '__main__':
         torch.from_numpy(vf_indices).long().cuda()
         for vf_indices in np.split(VF, NI[1:-1])
     ]
-    per_face_verts_scan = torch.from_numpy(
-        scan.vertices[scan.faces]).float().cuda()
-    face_normals_scan = torch.from_numpy(np.copy(
-        scan.face_normals)).float().cuda()
     exclude_indices = torch.from_numpy(exclude_indices).cuda().long()
     closest_match = partial(closest_point_triangle_match,
                             faces=faces,

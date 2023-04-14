@@ -70,13 +70,11 @@ def closest_point_on_triangle(verts: torch.Tensor,
                                                 target_per_face_verts,
                                                 first_idx, max_points,
                                                 min_triangle_area)
-
     # https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.104.4264&rep=rep1&type=pdf
-    pts = verts
     tris = target_per_face_verts[indices]
     tri_normals = target_vertex_normals[indices]
-    pt_proj = pts - torch.einsum('ab,ab->a', pts - tris[:, 0, :],
-                                 tri_normals)[..., None] * tri_normals
+    pt_proj = verts - torch.einsum('ab,ab->a', verts - tris[:, 0, :],
+                                   tri_normals)[..., None] * tri_normals
 
     return pt_proj, dists, indices
 
