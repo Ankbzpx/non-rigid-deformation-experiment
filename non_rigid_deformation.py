@@ -60,6 +60,27 @@ def uniform_vert_normals(
         [face_normals[vf_idx].mean(dim=0) for vf_idx in vert_face_adjacency])
 
 
+def closest_point_on_triangle(verts: torch.Tensor,
+                              target_per_face_verts: torch.Tensor,
+                              target_vertex_normals: torch.Tensor,
+                              min_triangle_area=5e-3):
+    max_points = len(verts)
+    first_idx = torch.tensor([0], device=verts.device).long()
+    dists, indices = _C.point_face_dist_forward(verts, first_idx,
+                                                target_per_face_verts,
+                                                first_idx, max_points,
+                                                min_triangle_area)
+
+    # https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.104.4264&rep=rep1&type=pdf
+    pts = verts
+    tris = target_per_face_verts[indices]
+    tri_normals = target_vertex_normals[indices]
+    pt_proj = pts - torch.einsum('ab,ab->a', pts - tris[:, 0, :],
+                                 tri_normals)[..., None] * tri_normals
+
+    return pt_proj, dists, indices
+
+
 def closest_point_triangle_match(verts: torch.Tensor,
                                  faces: torch.Tensor,
                                  vert_face_adjacency: list[torch.Tensor],
@@ -67,26 +88,15 @@ def closest_point_triangle_match(verts: torch.Tensor,
                                  target_vertex_normals: torch.Tensor,
                                  exclude_indices: torch.Tensor,
                                  dist_thr=5e-4,
-                                 cos_thr=0.0,
-                                 min_triangle_area=5e-3) -> list[torch.Tensor]:
-    max_points = len(verts)
-    first_idx = torch.tensor([0], device=verts.device).long()
-    dists, indices = _C.point_face_dist_forward(verts, first_idx,
-                                                target_per_face_verts,
-                                                first_idx, max_points,
-                                                min_triangle_area)
+                                 cos_thr=0.0) -> list[torch.Tensor]:
+    pt_proj, dists, indices = closest_point_on_triangle(verts,
+                                                        target_per_face_verts,
+                                                        target_vertex_normals)
     vert_normals = uniform_vert_normals(verts, faces, vert_face_adjacency)
     cos = torch.einsum('ab,ab->a', target_vertex_normals[indices], vert_normals)
     valid_mask = torch.logical_and(dists < dist_thr, cos > cos_thr)
     valid_mask[exclude_indices] = False
-
-    # https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.104.4264&rep=rep1&type=pdf
-    pts = verts[valid_mask]
-    tris = target_per_face_verts[indices[valid_mask]]
-    tri_normals = target_vertex_normals[indices[valid_mask]]
-    pt_proj = pts - torch.einsum('ab,ab->a', pts - tris[:, 0, :],
-                                 tri_normals)[..., None] * tri_normals
-    return valid_mask, pt_proj
+    return valid_mask, pt_proj[valid_mask]
 
 
 if __name__ == '__main__':
