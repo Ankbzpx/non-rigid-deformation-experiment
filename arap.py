@@ -3,6 +3,7 @@ import igl
 import scipy.sparse
 import scipy.sparse.linalg
 import scipy.linalg
+from icecream import ic
 
 
 def boundary_condition_bary(V, F, b_fid, b_bary_coords):
@@ -52,30 +53,58 @@ class LinearVertexSolver:
                  C_upper: scipy.sparse.spmatrix,
                  V: np.ndarray,
                  F: np.ndarray,
+                 V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
                  b_v_bounded=True,
+                 b_v_weight: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
                  b_bary_coords: np.ndarray | None = None,
-                 b_f_bounded=True):
+                 b_f_bounded=True,
+                 b_f_weight: np.ndarray | None = None):
+
+        if V_weight is not None:
+            assert len(V_weight) == len(V)
+        else:
+            V_weight = np.ones(len(V))
+
         C_lower = []
+        weights = []
         b_mask = np.ones(len(V)).astype(bool)
         if b_vid is not None:
-            C_v, b_v = boundary_condition(V, b_vid)
+            C_v, b_v_mask = boundary_condition(V, b_vid)
             C_lower.append(C_v)
+
+            if b_v_weight is not None:
+                assert len(b_v_weight) == len(b_vid)
+            else:
+                b_v_weight = np.ones(len(b_vid))
+            weights.append(b_v_weight)
+
             if b_v_bounded:
-                b_mask = np.logical_and(b_mask, b_v)
+                b_mask = np.logical_and(b_mask, b_v_mask)
+
         if b_fid is not None:
-            C_f, b_f = boundary_condition_bary(V, F, b_fid, b_bary_coords)
+            C_f, b_f_mask = boundary_condition_bary(V, F, b_fid, b_bary_coords)
             C_lower.append(C_f)
+
+            if b_f_weight is not None:
+                assert len(b_f_weight) == len(b_fid)
+            else:
+                b_f_weight = np.ones(len(b_fid))
+            weights.append(b_f_weight)
+
             if b_f_bounded:
-                b_mask = np.logical_and(b_mask, b_f)
+                b_mask = np.logical_and(b_mask, b_f_mask)
 
         C = scipy.sparse.vstack([C_upper[b_mask]] + C_lower)
+        weights = np.concatenate([V_weight[b_mask]] + weights)
+        W = scipy.sparse.diags(weights)
 
         self.b_mask = b_mask
         self.NBC = C.shape[0] - np.sum(b_mask)
         self.C_T = C.T
-        self.solve_factorized = scipy.sparse.linalg.factorized(C.T @ C)
+        self.W = W
+        self.solve_factorized = scipy.sparse.linalg.factorized(C.T @ W @ C)
 
     def verify_bc_dim(self, BC: np.ndarray) -> bool:
         assert self.NBC == len(BC)
@@ -86,25 +115,29 @@ class BiLaplacian(LinearVertexSolver):
     def __init__(self,
                  V: np.ndarray,
                  F: np.ndarray,
+                 V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
                  b_v_bounded=True,
+                 b_v_weight: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
                  b_bary_coords: np.ndarray | None = None,
-                 b_f_bounded=True):
+                 b_f_bounded=True,
+                 b_f_weight: np.ndarray | None = None):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Hybrid voronoi that guarantees positive area
         M: scipy.sparse.csc_matrix = igl.massmatrix(V, F,
                                                     igl.MASSMATRIX_TYPE_VORONOI)
         M_inv = scipy.sparse.diags(1 / M.diagonal())
         C_upper = L @ M_inv @ L
-        super().__init__(C_upper, V, F, b_vid, b_v_bounded, b_fid,
-                         b_bary_coords, b_f_bounded)
+        super().__init__(C_upper, V, F, V_weight, b_vid, b_v_bounded,
+                         b_v_weight, b_fid, b_bary_coords, b_f_bounded,
+                         b_f_weight)
         self.B_upper = np.zeros((np.sum(self.b_mask), 3))
 
     def solve(self, BC: np.ndarray):
         self.verify_bc_dim(BC)
         B = np.vstack([self.B_upper, BC])
-        return self.solve_factorized(self.C_T @ B)
+        return self.solve_factorized(self.C_T @ self.W @ B)
 
 
 class AsRigidAsPossible(LinearVertexSolver):
@@ -112,16 +145,20 @@ class AsRigidAsPossible(LinearVertexSolver):
     def __init__(self,
                  V: np.ndarray,
                  F: np.ndarray,
+                 V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
                  b_v_bounded=True,
+                 b_v_weight: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
                  b_bary_coords: np.ndarray | None = None,
-                 b_f_bounded=True):
+                 b_f_bounded=True,
+                 b_f_weight: np.ndarray | None = None):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Negative diagonal
         C_upper = -L
-        super().__init__(C_upper, V, F, b_vid, b_v_bounded, b_fid,
-                         b_bary_coords, b_f_bounded)
+        super().__init__(C_upper, V, F, V_weight, b_vid, b_v_bounded,
+                         b_v_weight, b_fid, b_bary_coords, b_f_bounded,
+                         b_f_weight)
 
         V_cot_adj_coo = scipy.sparse.coo_array(L)
         valid_entries_mask = V_cot_adj_coo.col != V_cot_adj_coo.row
@@ -147,7 +184,7 @@ class AsRigidAsPossible(LinearVertexSolver):
             # TODO: add stiffness weight
             B_upper = self.build_arap_rhs(V_arap)[self.b_mask]
             B = np.vstack([B_upper, BC])
-            V_arap = self.solve_factorized(self.C_T @ B)
+            V_arap = self.solve_factorized(self.C_T @ self.W @ B)
         return V_arap
 
     def build_arap_rhs(self, V_arap: np.ndarray) -> np.ndarray:
@@ -176,7 +213,6 @@ class AsRigidAsPossible(LinearVertexSolver):
 
 if __name__ == '__main__':
     import polyscope as ps
-    from icecream import ic
     from scipy.spatial.transform import Rotation
     from mesh_helper import read_obj
 
