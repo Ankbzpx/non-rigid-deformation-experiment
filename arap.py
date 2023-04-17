@@ -10,7 +10,8 @@ from jax import vmap
 
 def boundary_condition_bary(V, F, b_fid, b_bary_coords):
     '''
-    Boundary condition barycentric
+    Helper to build Boundary condition from barycentric coordinates
+
         V: mesh vertices
         F: mesh faces
         b_fid: boundary faces
@@ -33,9 +34,10 @@ def boundary_condition_bary(V, F, b_fid, b_bary_coords):
 
 def boundary_condition(V, b_vid):
     '''
-    Boundary condition
+    Helper to Boundary condition from vertex index
+
         V: mesh vertices
-        b_vid: boundary vertex index
+        b_vid: vertex boundary index
     '''
     NV = len(V)
     NH = len(b_vid)
@@ -50,6 +52,26 @@ def boundary_condition(V, b_vid):
 
 
 class LinearVertexSolver:
+    '''
+    Solve C @ V = B with respect to boundary condition V_b = B_b
+        Specifically, we build
+            C = [C_upper, C_b]^T
+            B = [B, B_b]^T
+        then solve
+            C^T @ C @ X = C^T @ B
+
+        C_upper: objective
+        V: mesh vertices
+        F: mesh faces
+        V_weight: per vertex weight
+        b_vid: vertex boundary index
+        b_v_bounded: whether to exclude vertex boundary from objective
+        b_v_weight: vertex boundary weights
+        b_fid: boundary faces
+        b_bary_coords: barycentric coordinate for each boundary face
+        b_f_bounded: whether to exclude barycentric boundary from objective
+        b_f_weight: barycentric boundary weights
+    '''
 
     def __init__(self,
                  C_upper: scipy.sparse.spmatrix,
@@ -143,6 +165,7 @@ class BiLaplacian(LinearVertexSolver):
         return self.solve_factorized(self.C_T @ self.W @ B)
 
 
+# https://igl.ethz.ch/projects/ARAP/arap_web.pdf
 class AsRigidAsPossible(LinearVertexSolver):
 
     def __init__(self,
@@ -162,7 +185,7 @@ class AsRigidAsPossible(LinearVertexSolver):
         super().__init__(C_upper, V, F, V_weight, b_vid, b_v_bounded,
                          b_v_weight, b_fid, b_bary_coords, b_f_bounded,
                          b_f_weight)
-
+        # get one-ring neighbour from cotangent matrix
         V_cot_adj_coo = scipy.sparse.coo_array(L)
         valid_entries_mask = V_cot_adj_coo.col != V_cot_adj_coo.row
         # col major
@@ -173,10 +196,12 @@ class AsRigidAsPossible(LinearVertexSolver):
         assert (E_unique != np.arange(len(V))).sum() == 0
         split_indices = np.cumsum(E_count)[:-1]
 
-        pad_width = np.max(E_count)
         E_i_list = np.split(E_i, split_indices)
         E_j_list = np.split(E_j, split_indices)
         E_weight_list = np.split(E_weight, split_indices)
+
+        # pad so it can be vmapped
+        pad_width = np.max(E_count)
 
         def pad_list_of_array(list_of_array):
             return np.array([
@@ -199,20 +224,23 @@ class AsRigidAsPossible(LinearVertexSolver):
               max_iters=8) -> np.ndarray:
         self.verify_bc_dim(BC)
         for _ in range(max_iters):
+            # minimize R
             B_upper = self.build_arap_rhs(V_arap)[self.b_mask]
             B = np.vstack([B_upper, BC])
+            # minimize V
             V_arap = self.solve_factorized(self.C_T @ self.W @ B)
         return V_arap
 
     def build_arap_rhs(self, V_arap: np.ndarray) -> np.ndarray:
         Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
 
+        # \sum_{j \in \mathcal{N}(i)} w_{ij} R_i (p_i - p_j)
         def arap_rhs(eij, eij_, e_weight):
             cov = eij_.T @ jnp.diag(e_weight) @ eij
             U, S, V_T = jnp.linalg.svd(cov)
             R = U @ V_T
 
-            # Reflection
+            # Handle reflection
             E = jnp.eye(len(cov))
             min_idx = jnp.argmin(S)
             E = E.at[min_idx, min_idx].set(jnp.sign(jnp.linalg.det(R)))

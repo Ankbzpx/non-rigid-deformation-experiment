@@ -14,6 +14,7 @@ from joblib import Parallel, delayed
 from arap import boundary_condition, boundary_condition_bary
 
 
+# https://igl.ethz.ch/projects/bbw/bounded-biharmonic-weights-siggraph-2011-jacobson-et-al.pdf
 class BoundedBiharmonicWeights:
 
     def __init__(self, V, F, sp_fid: np.ndarray | None = None, sp_weight=1e2):
@@ -21,8 +22,10 @@ class BoundedBiharmonicWeights:
         M: scipy.sparse.csc_matrix = igl.massmatrix(V, F,
                                                     igl.MASSMATRIX_TYPE_VORONOI)
         M_inv = scipy.sparse.diags(1 / M.diagonal())
+        # minimize Laplacian energy
         Q = L @ M_inv @ L
 
+        # shape preseverance
         if sp_fid is not None:
             f_weights = np.zeros(len(F))
             f_weights[sp_fid] = sp_weight
@@ -30,6 +33,7 @@ class BoundedBiharmonicWeights:
 
             M_tile = scipy.sparse.diags(np.repeat(f_weights, 3))
             G = igl.grad(V, F)
+            # minimize Dirichlet energy
             Q += G.T @ M_tile @ G
 
         self.Q = Q
@@ -49,6 +53,7 @@ class BoundedBiharmonicWeights:
                 prob.setup(P=self.Q, A=A, l=l, u=u, verbose=False)
             else:
                 prob.update(l=l, u=u)
+            # initial guess
             prob.warm_start(x=np.zeros((self.NV)))
             res = prob.solve()
             assert res.info.status == 'solved'
@@ -59,6 +64,11 @@ class BoundedBiharmonicWeights:
                 b_vid: np.ndarray | None = None,
                 b_fid: np.ndarray | None = None,
                 b_bary_coords: np.ndarray | None = None) -> np.ndarray:
+        '''
+        Compute BBW
+
+        WARNING: barycentric boundary may fail the solver (the inequality cannot meet)
+        '''
 
         A = []
         handle_size = 0
@@ -73,6 +83,7 @@ class BoundedBiharmonicWeights:
             A.append(A_f)
         A = scipy.sparse.vstack(A + [scipy.sparse.identity(self.NV)]).tocsc()
 
+        # split into batches for parallel computation
         handle_weights = np.eye(handle_size)
         total_size = handle_weights.shape[1]
         batch_size = total_size // self.item_per_batch
@@ -85,12 +96,14 @@ class BoundedBiharmonicWeights:
                 handle_weights[:, batch_size * self.item_per_batch:]
             ]
 
+        # reduce n_jobs if the computation is too intense
         bbw_weights = np.concatenate(
             Parallel(n_jobs=multiprocessing.cpu_count())(
                 delayed(self.solve_bbw)(A, weights_batch)
                 for weights_batch in weights_batch_list),
             axis=1)
 
+        # partition of unity
         return bbw_weights / np.sum(bbw_weights, 1, keepdims=True)
 
 
