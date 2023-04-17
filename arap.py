@@ -4,6 +4,9 @@ import scipy.sparse
 import scipy.sparse.linalg
 import scipy.linalg
 from icecream import ic
+import jax.numpy as jnp
+from jax import vmap
+from jax.lax import dynamic_slice
 
 
 def boundary_condition_bary(V, F, b_fid, b_bary_coords):
@@ -171,10 +174,25 @@ class AsRigidAsPossible(LinearVertexSolver):
         assert (E_unique != np.arange(len(V))).sum() == 0
         split_indices = np.cumsum(E_count)[:-1]
 
-        self.V = V
-        self.E_i_list = np.split(E_i, split_indices)
-        self.E_j_list = np.split(E_j, split_indices)
-        self.E_weight_list = np.split(E_weight, split_indices)
+        pad_width = np.max(E_count)
+        E_i_list = np.split(E_i, split_indices)
+        E_j_list = np.split(E_j, split_indices)
+        E_weight_list = np.split(E_weight, split_indices)
+
+        def pad_list_of_array(list_of_array):
+            return np.array([
+                np.concatenate([el, np.zeros(pad_width - len(el))])
+                for el in list_of_array
+            ])
+
+        E_i = pad_list_of_array(E_i_list).astype(np.int64)
+        E_j = pad_list_of_array(E_j_list).astype(np.int64)
+        E_weight = pad_list_of_array(E_weight_list)
+
+        self.Eij = jnp.array(V[E_i] - V[E_j])
+        self.E_i = jnp.array(E_i)
+        self.E_j = jnp.array(E_j)
+        self.E_weight = jnp.array(E_weight)
 
     def solve(self,
               BC: np.ndarray,
@@ -189,27 +207,24 @@ class AsRigidAsPossible(LinearVertexSolver):
         return V_arap
 
     def build_arap_rhs(self, V_arap: np.ndarray) -> np.ndarray:
-        arap_rhs = []
-        for (e_i, e_j, e_weight) in zip(self.E_i_list, self.E_j_list,
-                                        self.E_weight_list):
-            eij = self.V[e_i] - self.V[e_j]
-            eij_ = V_arap[e_i] - V_arap[e_j]
-            cov = eij_.T @ np.diag(e_weight) @ eij
+        V_arap = jnp.array(V_arap)
+        Eij_ = V_arap[self.E_i] - V_arap[self.E_j]
 
-            U, S, V_T = np.linalg.svd(cov)
+        def arap_rhs(eij, eij_, e_weight):
+            cov = eij_.T @ jnp.diag(e_weight) @ eij
+            U, S, V_T = jnp.linalg.svd(cov)
             R = U @ V_T
 
             # Reflection
-            if np.linalg.det(R) < 0:
-                E = np.eye(len(cov))
-                min_idx = np.argmin(S)
-                E[min_idx, min_idx] = -1
-                R = U @ E @ V_T
+            E = jnp.eye(len(cov))
+            min_idx = jnp.argmin(S)
+            E = E.at[min_idx, min_idx].set(jnp.sign(jnp.linalg.det(R)))
+            R = U @ E @ V_T
 
-            b = (e_weight[:, None] * eij @ R.T).sum(0)
-            arap_rhs.append(b)
-        arap_rhs = np.stack(arap_rhs)
-        return arap_rhs
+            return (e_weight[:, None] * eij @ R.T).sum(0)
+
+        B = vmap(arap_rhs)(self.Eij, Eij_, self.E_weight)
+        return np.asarray(B)
 
 
 if __name__ == '__main__':
