@@ -6,7 +6,6 @@ import scipy.linalg
 from icecream import ic
 import jax.numpy as jnp
 from jax import vmap
-from jax.lax import dynamic_slice
 
 
 def boundary_condition_bary(V, F, b_fid, b_bary_coords):
@@ -190,8 +189,8 @@ class AsRigidAsPossible(LinearVertexSolver):
         E_weight = pad_list_of_array(E_weight_list)
 
         self.Eij = jnp.array(V[E_i] - V[E_j])
-        self.E_i = jnp.array(E_i)
-        self.E_j = jnp.array(E_j)
+        self.E_i = E_i
+        self.E_j = E_j
         self.E_weight = jnp.array(E_weight)
 
     def solve(self,
@@ -200,15 +199,13 @@ class AsRigidAsPossible(LinearVertexSolver):
               max_iters=8) -> np.ndarray:
         self.verify_bc_dim(BC)
         for _ in range(max_iters):
-            # TODO: add stiffness weight
             B_upper = self.build_arap_rhs(V_arap)[self.b_mask]
             B = np.vstack([B_upper, BC])
             V_arap = self.solve_factorized(self.C_T @ self.W @ B)
         return V_arap
 
     def build_arap_rhs(self, V_arap: np.ndarray) -> np.ndarray:
-        V_arap = jnp.array(V_arap)
-        Eij_ = V_arap[self.E_i] - V_arap[self.E_j]
+        Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
 
         def arap_rhs(eij, eij_, e_weight):
             cov = eij_.T @ jnp.diag(e_weight) @ eij
@@ -223,8 +220,8 @@ class AsRigidAsPossible(LinearVertexSolver):
 
             return (e_weight[:, None] * eij @ R.T).sum(0)
 
-        B = vmap(arap_rhs)(self.Eij, Eij_, self.E_weight)
-        return np.asarray(B)
+        RHS = vmap(arap_rhs)(self.Eij, Eij_, self.E_weight)
+        return np.asarray(RHS)
 
 
 if __name__ == '__main__':
