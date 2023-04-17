@@ -106,27 +106,33 @@ if __name__ == '__main__':
 
     max_iter = 20
     dist_thrs = np.linspace(1e-3, 1e-5, max_iter)
-    cos_thrs = np.linspace(0, 0.95, max_iter)
+    cos_thrs = np.linspace(0.5, 0.95, max_iter)
+    closest_match_weights = np.linspace(1, 1e3, max_iter)
+    landmark_weights = np.linspace(1, 1, max_iter)
 
     for i in tqdm(range(max_iter)):
         dist_thr = dist_thrs[i]
         cos_thr = cos_thrs[i]
+        b_v_weight = closest_match_weights[i]
+        b_f_weight = landmark_weights[i]
         B, BC = get_closest_match(V_arap, dist_thr=dist_thr, cos_thr=cos_thr)
 
         arap = AsRigidAsPossible(V,
                                  F,
                                  b_vid=B,
                                  b_v_bounded=False,
+                                 b_v_weight=b_v_weight * np.ones(len(B)),
                                  b_fid=lms_fid,
                                  b_bary_coords=lms_bary_coords,
-                                 b_f_bounded=False)
+                                 b_f_bounded=False,
+                                 b_f_weight=b_f_weight * np.ones(len(lms_fid)))
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
 
     ps.init()
-    ps.register_surface_mesh("template", V, F)
+    ps.register_surface_mesh("template", V, F, enabled=False)
     ps.register_surface_mesh("template_arap", V_arap, F)
-    ps.register_surface_mesh("scan", scan.vertices, scan.faces)
+    ps.register_surface_mesh("scan", scan.vertices, scan.faces, enabled=False)
     ps.show()
 
     template.vertices = V_arap
-    write_obj("results/lm_nicp_arap.obj", template)
+    write_obj("results/lm_nicp_arap_weighted.obj", template)

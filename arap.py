@@ -97,14 +97,15 @@ class LinearVertexSolver:
                 b_mask = np.logical_and(b_mask, b_f_mask)
 
         C = scipy.sparse.vstack([C_upper[b_mask]] + C_lower)
+        C_T = C.T.tocsc()
         weights = np.concatenate([V_weight[b_mask]] + weights)
         W = scipy.sparse.diags(weights)
 
         self.b_mask = b_mask
         self.NBC = C.shape[0] - np.sum(b_mask)
-        self.C_T = C.T
+        self.C_T = C_T
         self.W = W
-        self.solve_factorized = scipy.sparse.linalg.factorized(C.T @ W @ C)
+        self.solve_factorized = scipy.sparse.linalg.factorized(C_T @ W @ C)
 
     def verify_bc_dim(self, BC: np.ndarray) -> bool:
         assert self.NBC == len(BC)
