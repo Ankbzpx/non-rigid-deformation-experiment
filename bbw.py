@@ -10,19 +10,29 @@ import scipy.optimize
 import osqp    # Doc: https://osqp.org/docs/interfaces/python.html#python-interface
 import multiprocessing
 from joblib import Parallel, delayed
-import time
 
 from arap import boundary_condition, boundary_condition_bary
 
 
 class BoundedBiharmonicWeights:
-    # TODO add shape perseverance
-    def __init__(self, V, F):
+
+    def __init__(self, V, F, sp_fid: np.ndarray | None = None, sp_weight=1e2):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         M: scipy.sparse.csc_matrix = igl.massmatrix(V, F,
                                                     igl.MASSMATRIX_TYPE_VORONOI)
         M_inv = scipy.sparse.diags(1 / M.diagonal())
-        self.Q = L @ M_inv @ L
+        Q = L @ M_inv @ L
+
+        if sp_fid is not None:
+            f_weights = np.zeros(len(F))
+            f_weights[sp_fid] = sp_weight
+            f_weights = f_weights * igl.doublearea(V, F)
+
+            M_tile = scipy.sparse.diags(np.repeat(f_weights, 3))
+            G = igl.grad(V, F)
+            Q += G.T @ M_tile @ G
+
+        self.Q = Q
         self.V = V
         self.F = F
         self.NV = len(V)
