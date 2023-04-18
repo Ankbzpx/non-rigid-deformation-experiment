@@ -29,6 +29,13 @@ if __name__ == '__main__':
 
     face_groups = np.split(template.faces, template.polygon_groups[1:])
 
+    # handle_group_ids = [0, 16, 18, 19, 21, 22]
+    # boundary_handle_list = [
+    #     np.unique(igl.boundary_facets(face_groups[id]))
+    #     for id in handle_group_ids
+    # ]
+    # boundary_handle_indices = np.unique(np.concatenate(boundary_handle_list))
+
     # 3 Tongue
     # 6 Ears
     # 10 Right Eye
@@ -39,6 +46,31 @@ if __name__ == '__main__':
             face_groups[3].reshape(-1), face_groups[10].reshape(-1),
             face_groups[13].reshape(-1)
         ]))
+
+    V_2d = template.uvs[template.face_uvs_idx].mean(1)
+
+    mouth_left_corner_mask = np.logical_and(
+        np.logical_and(V_2d[:, 0] > 0.4163, V_2d[:, 0] < 0.4522),
+        np.logical_and(V_2d[:, 1] > 0.4335, V_2d[:, 1] < 0.4714))
+
+    mouth_right_corner_mask = np.logical_and(
+        np.logical_and(V_2d[:, 0] > 1.0 - 0.4522, V_2d[:, 0] < 1.0 - 0.4163),
+        np.logical_and(V_2d[:, 1] > 0.4335, V_2d[:, 1] < 0.4714))
+
+    mouth_corner_mask = np.logical_or(mouth_left_corner_mask,
+                                      mouth_right_corner_mask)
+    mouth_corner_vid = np.unique(F[mouth_corner_mask])
+
+    eye_left_corner_mask = np.logical_and(
+        np.logical_and(V_2d[:, 0] > 0.6113, V_2d[:, 0] < 0.6429),
+        np.logical_and(V_2d[:, 1] > 0.6104, V_2d[:, 1] < 0.6384))
+
+    eye_right_corner_mask = np.logical_and(
+        np.logical_and(V_2d[:, 0] > 1.0 - 0.6429, V_2d[:, 0] < 1.0 - 0.6113),
+        np.logical_and(V_2d[:, 1] > 0.6104, V_2d[:, 1] < 0.6384))
+
+    eye_corner_mask = np.logical_or(eye_left_corner_mask, eye_right_corner_mask)
+    eye_corner_vid = np.unique(F[eye_corner_mask])
 
     scan: trimesh.Trimesh = trimesh.load('data/scan_decimated.obj',
                                          process=False,
@@ -56,11 +88,19 @@ if __name__ == '__main__':
         torch.from_numpy(scan_lms).float().cuda(), per_face_verts_scan,
         face_normals_scan)[0].detach().cpu().numpy()
 
+    b_f_weight = np.ones(len(lms_fid))
+    b_f_weight[np.in1d(lms_fid, np.arange(NF)[mouth_corner_mask])] = 1e-1
+
+    V_weight = np.ones(len(V))
+    V_weight[eye_corner_vid] = 1e3
+
     arap = AsRigidAsPossible(V,
                              F,
+                             V_weight=V_weight,
                              b_fid=lms_fid,
                              b_bary_coords=lms_bary_coords,
-                             b_f_bounded=False)
+                             b_f_bounded=False,
+                             b_f_weight=b_f_weight)
     V_arap = arap.solve(scan_lms, V)
 
     # template_lms = (V[F[lms_fid]] * lms_bary_coords[..., None]).sum(1)
@@ -105,27 +145,32 @@ if __name__ == '__main__':
         return B, BC
 
     max_iter = 20
-    dist_thrs = np.linspace(1e-3, 1e-5, max_iter)
+    dist_thrs = np.linspace(5e-4, 1e-5, max_iter)
     cos_thrs = np.linspace(0.5, 0.95, max_iter)
     closest_match_weights = np.linspace(1, 1e3, max_iter)
-    landmark_weights = np.linspace(1, 1, max_iter)
 
     for i in tqdm(range(max_iter)):
         dist_thr = dist_thrs[i]
         cos_thr = cos_thrs[i]
         b_v_weight = closest_match_weights[i]
-        b_f_weight = landmark_weights[i]
         B, BC = get_closest_match(V_arap, dist_thr=dist_thr, cos_thr=cos_thr)
+
+        b_v_weight = b_v_weight * np.ones(len(B))
+        v_mask = np.in1d(B, mouth_corner_vid)
+        b_v_weight[v_mask] = 1e-2
+        v_mask = np.in1d(B, eye_corner_vid)
+        b_v_weight[v_mask] = 1e-2
 
         arap = AsRigidAsPossible(V,
                                  F,
+                                 V_weight=V_weight,
                                  b_vid=B,
                                  b_v_bounded=False,
-                                 b_v_weight=b_v_weight * np.ones(len(B)),
+                                 b_v_weight=b_v_weight,
                                  b_fid=lms_fid,
                                  b_bary_coords=lms_bary_coords,
                                  b_f_bounded=False,
-                                 b_f_weight=b_f_weight * np.ones(len(lms_fid)))
+                                 b_f_weight=b_f_weight)
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
 
     ps.init()
@@ -135,4 +180,4 @@ if __name__ == '__main__':
     ps.show()
 
     template.vertices = V_arap
-    write_obj("results/lm_nicp_arap_weighted.obj", template)
+    write_obj("results/lm_nicp_arap_weighted_eye_mouth.obj", template)
