@@ -3,38 +3,41 @@ import polyscope as ps
 from icecream import ic
 import igl
 import json
+from glob import glob
 
-from mesh_helper import read_obj, write_obj
+from mesh_helper import read_obj, write_obj, load_face_landmarks
 from arap import AsRigidAsPossible
 import torch
 from non_rigid_deformation import closest_point_triangle_match, closest_point_on_triangle
 import trimesh
 from functools import partial
 from tqdm import tqdm
+from corase_match_svd import match_correspondence
+import copy
+import os
+from functools import partial
 
-if __name__ == '__main__':
-    template = read_obj('results/template_icp_match.obj')
-    lms_data = np.array(json.load(open('results/template_icp_match_lms.txt')))
-    lms_fid = np.int64(lms_data[:, 0])
-    lms_uv = np.float64(lms_data[:, 1:])
 
-    lms_bary_coords = np.stack(
-        [lms_uv[:, 0], lms_uv[:, 1], 1 - lms_uv[:, 0] - lms_uv[:, 1]], -1)
+def solve_deform(template, lms_fid, lms_bary_coords, template_lms, scan_path,
+                 scan_lms_path):
+    ic(scan_path, scan_lms_path)
 
-    V = template.vertices
+    scan: trimesh.Trimesh = trimesh.load(scan_path,
+                                         process=False,
+                                         maintain_order=True)
+    scan_lms_data = json.load(open(scan_lms_path))
+    scan_lms = np.stack(
+        [np.array([lm['x'], lm['y'], lm['z']]) for lm in scan_lms_data])
+
+    R, s, t = match_correspondence(template_lms, scan_lms)
+
+    V = s * template.vertices @ R.T + t
     F = template.faces
 
     NV = len(V)
     NF = len(F)
 
     face_groups = np.split(template.faces, template.polygon_groups[1:])
-
-    # handle_group_ids = [0, 16, 18, 19, 21, 22]
-    # boundary_handle_list = [
-    #     np.unique(igl.boundary_facets(face_groups[id]))
-    #     for id in handle_group_ids
-    # ]
-    # boundary_handle_indices = np.unique(np.concatenate(boundary_handle_list))
 
     # 3 Tongue
     # 6 Ears
@@ -47,38 +50,6 @@ if __name__ == '__main__':
             face_groups[13].reshape(-1)
         ]))
 
-    V_2d = template.uvs[template.face_uvs_idx].mean(1)
-
-    mouth_left_corner_mask = np.logical_and(
-        np.logical_and(V_2d[:, 0] > 0.4163, V_2d[:, 0] < 0.4522),
-        np.logical_and(V_2d[:, 1] > 0.4335, V_2d[:, 1] < 0.4714))
-
-    mouth_right_corner_mask = np.logical_and(
-        np.logical_and(V_2d[:, 0] > 1.0 - 0.4522, V_2d[:, 0] < 1.0 - 0.4163),
-        np.logical_and(V_2d[:, 1] > 0.4335, V_2d[:, 1] < 0.4714))
-
-    mouth_corner_mask = np.logical_or(mouth_left_corner_mask,
-                                      mouth_right_corner_mask)
-    mouth_corner_vid = np.unique(F[mouth_corner_mask])
-
-    eye_left_corner_mask = np.logical_and(
-        np.logical_and(V_2d[:, 0] > 0.6113, V_2d[:, 0] < 0.6429),
-        np.logical_and(V_2d[:, 1] > 0.6104, V_2d[:, 1] < 0.6384))
-
-    eye_right_corner_mask = np.logical_and(
-        np.logical_and(V_2d[:, 0] > 1.0 - 0.6429, V_2d[:, 0] < 1.0 - 0.6113),
-        np.logical_and(V_2d[:, 1] > 0.6104, V_2d[:, 1] < 0.6384))
-
-    eye_corner_mask = np.logical_or(eye_left_corner_mask, eye_right_corner_mask)
-    eye_corner_vid = np.unique(F[eye_corner_mask])
-
-    scan: trimesh.Trimesh = trimesh.load('data/scan_decimated.obj',
-                                         process=False,
-                                         maintain_order=True)
-    scan_lms_data = json.load(open('data/scan_3d.txt'))
-    scan_lms = np.stack(
-        [np.array([lm['x'], lm['y'], lm['z']]) for lm in scan_lms_data])
-
     per_face_verts_scan = torch.from_numpy(
         scan.vertices[scan.faces]).float().cuda()
     face_normals_scan = torch.from_numpy(np.copy(
@@ -88,38 +59,12 @@ if __name__ == '__main__':
         torch.from_numpy(scan_lms).float().cuda(), per_face_verts_scan,
         face_normals_scan)[0].detach().cpu().numpy()
 
-    b_f_weight = np.ones(len(lms_fid))
-    b_f_weight[np.in1d(lms_fid, np.arange(NF)[mouth_corner_mask])] = 1e-1
-
-    V_weight = np.ones(len(V))
-    V_weight[eye_corner_vid] = 1e3
-
     arap = AsRigidAsPossible(V,
                              F,
-                             V_weight=V_weight,
                              b_fid=lms_fid,
                              b_bary_coords=lms_bary_coords,
-                             b_f_bounded=False,
-                             b_f_weight=b_f_weight)
+                             b_f_bounded=False)
     V_arap = arap.solve(scan_lms, V)
-
-    # template_lms = (V[F[lms_fid]] * lms_bary_coords[..., None]).sum(1)
-    # template_lms_arap = (V_arap[F[lms_fid]] * lms_bary_coords[..., None]).sum(1)
-
-    # ps.init()
-    # ps.register_surface_mesh("template", V, F, enabled=False)
-    # ps.register_surface_mesh("template_arap", V_arap, F)
-    # ps.register_surface_mesh("scan", scan.vertices, scan.faces)
-    # ps.register_point_cloud("template_lms",
-    #                         template_lms,
-    #                         radius=2e-3,
-    #                         enabled=False)
-    # ps.register_point_cloud("template_lms_arap", template_lms_arap, radius=2e-3)
-    # ps.register_point_cloud("scan_lms", scan_lms, radius=2e-3)
-    # ps.show()
-
-    # template.vertices = V_arap
-    # write_obj("results/lm_arap.obj", template)
 
     faces = torch.from_numpy(F).long().cuda()
     VF, NI = igl.vertex_triangle_adjacency(F, NV)
@@ -145,39 +90,84 @@ if __name__ == '__main__':
         return B, BC
 
     max_iter = 20
-    dist_thrs = np.linspace(5e-4, 1e-5, max_iter)
+    dist_thrs = np.linspace(1e-3, 1e-5, max_iter)
     cos_thrs = np.linspace(0.5, 0.95, max_iter)
     closest_match_weights = np.linspace(1, 1e3, max_iter)
+    landmark_weights = np.linspace(1, 1, max_iter)
 
     for i in tqdm(range(max_iter)):
         dist_thr = dist_thrs[i]
         cos_thr = cos_thrs[i]
         b_v_weight = closest_match_weights[i]
+        b_f_weight = landmark_weights[i]
         B, BC = get_closest_match(V_arap, dist_thr=dist_thr, cos_thr=cos_thr)
-
-        b_v_weight = b_v_weight * np.ones(len(B))
-        v_mask = np.in1d(B, mouth_corner_vid)
-        b_v_weight[v_mask] = 1e-2
-        v_mask = np.in1d(B, eye_corner_vid)
-        b_v_weight[v_mask] = 1e-2
 
         arap = AsRigidAsPossible(V,
                                  F,
-                                 V_weight=V_weight,
                                  b_vid=B,
                                  b_v_bounded=False,
-                                 b_v_weight=b_v_weight,
+                                 b_v_weight=b_v_weight * np.ones(len(B)),
                                  b_fid=lms_fid,
                                  b_bary_coords=lms_bary_coords,
                                  b_f_bounded=False,
-                                 b_f_weight=b_f_weight)
+                                 b_f_weight=b_f_weight * np.ones(len(lms_fid)))
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
 
-    ps.init()
-    ps.register_surface_mesh("template", V, F, enabled=False)
-    ps.register_surface_mesh("template_arap", V_arap, F)
-    ps.register_surface_mesh("scan", scan.vertices, scan.faces, enabled=False)
-    ps.show()
+    return V_arap
 
-    template.vertices = V_arap
-    write_obj("results/lm_nicp_arap_weighted_eye_mouth.obj", template)
+
+if __name__ == '__main__':
+    template_path = 'results/template_icp_match.obj'
+    tempalte_landmark_path = 'results/template_icp_match_lms.txt'
+
+    scan_path_list = sorted(glob('registration/mesh/*.obj'))
+    scan_lms_path_list = sorted(
+        glob('registration/landmark/landmarks_xyz_41/*.json'))
+
+    template = read_obj(template_path)
+    lms_data = np.array(json.load(open(tempalte_landmark_path)))
+    lms_fid = np.int64(lms_data[:, 0])
+    lms_uv = np.float64(lms_data[:, 1:])
+
+    lms_bary_coords = np.stack(
+        [lms_uv[:, 0], lms_uv[:, 1], 1 - lms_uv[:, 0] - lms_uv[:, 1]], -1)
+
+    template_lms = load_face_landmarks(template, tempalte_landmark_path)
+
+    solve_deform_partial = partial(solve_deform, template, lms_fid,
+                                   lms_bary_coords, template_lms)
+
+    for scan_path, scan_lms_path in zip(scan_path_list, scan_lms_path_list):
+
+        V_arap = solve_deform_partial(scan_path, scan_lms_path)
+
+        model_save = copy.deepcopy(template)
+        model_save.vertices = V_arap
+
+        # remove eyeball and tongue
+        fid = np.arange(len(model_save.faces_quad))
+        face_group_ids = np.split(fid, model_save.polygon_groups_quad[1:])
+
+        select_faces_mask = np.ones(len(model_save.faces_quad))
+        select_faces_mask[face_group_ids[3]] = 0.
+        select_faces_mask[face_group_ids[10]] = 0.
+        select_faces_mask[face_group_ids[13]] = 0.
+        select_faces_mask = select_faces_mask.astype(bool)
+
+        select_faces = model_save.faces_quad[select_faces_mask]
+        select_face_uvs = model_save.face_uvs_idx_quad[select_faces_mask]
+
+        vertex_ids, verts_unique_inverse = np.unique(select_faces,
+                                                     return_inverse=True)
+        model_save.vertices = model_save.vertices[vertex_ids]
+
+        uv_ids, uv_unique_inverse = np.unique(select_face_uvs,
+                                              return_inverse=True)
+        model_save.uvs = model_save.uvs[uv_ids]
+
+        model_save.faces_quad = np.arange(
+            len(vertex_ids))[verts_unique_inverse].reshape(-1, 4)
+        model_save.face_uvs_idx_quad = np.arange(
+            len(uv_ids))[uv_unique_inverse].reshape(-1, 4)
+
+        write_obj(os.path.join('results', scan_path.split('/')[-1]), model_save)
