@@ -1,11 +1,9 @@
-import numpy as np
-import polyscope as ps
-from icecream import ic
+import argparse
 import igl
 import json
-from glob import glob
+import numpy as np
 
-from mesh_helper import read_obj, write_obj, load_face_landmarks
+from mesh_helper import read_obj, write_obj, load_face_landmarks, OBJMesh
 from arap import AsRigidAsPossible
 import torch
 from non_rigid_deformation import closest_point_triangle_match, closest_point_on_triangle
@@ -14,14 +12,34 @@ from functools import partial
 from tqdm import tqdm
 from corase_match_svd import match_correspondence
 import copy
-import os
 from functools import partial
 
+# Debug
+import polyscope as ps
+from icecream import ic
 
-def solve_deform(template, lms_fid, lms_bary_coords, template_lms, scan_path,
-                 scan_lms_path):
-    ic(scan_path, scan_lms_path)
 
+def load_template(template_path, template_lm_path):
+    template = read_obj(template_path)
+    lms_data = np.array(json.load(open(template_lm_path)))
+    lms_fid = np.int64(lms_data[:, 0])
+    lms_uv = np.float64(lms_data[:, 1:])
+
+    lms_bary_coords = np.stack(
+        [lms_uv[:, 0], lms_uv[:, 1], 1 - lms_uv[:, 0] - lms_uv[:, 1]], -1)
+
+    template_lms = load_face_landmarks(template, template_lm_path)
+
+    return {
+        "template": template,
+        "lms_fid": lms_fid,
+        "lms_bary_coords": lms_bary_coords,
+        "template_lms": template_lms
+    }
+
+
+def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
+                 scan_path, scan_lms_path):
     scan: trimesh.Trimesh = trimesh.load(scan_path,
                                          process=False,
                                          maintain_order=True)
@@ -113,38 +131,48 @@ def solve_deform(template, lms_fid, lms_bary_coords, template_lms, scan_path,
                                  b_f_weight=b_f_weight * np.ones(len(lms_fid)))
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
 
-    return V_arap
+    model_matched = copy.deepcopy(template)
+    model_matched.vertices = V_arap
+
+    return model_matched
 
 
 if __name__ == '__main__':
-    template_path = 'results/template_icp_match.obj'
-    tempalte_landmark_path = 'results/template_icp_match_lms.txt'
+    parser = argparse.ArgumentParser(description='ARAP + Non-rigid ICP.')
+    parser.add_argument('--template_pg_path',
+                        type=str,
+                        default='results/template_pg.obj')
+    parser.add_argument('--template_pg_lm_path',
+                        type=str,
+                        default='results/template_pg_lms.txt')
+    parser.add_argument('--scan_path', type=str, default='data/scan.ply')
+    parser.add_argument('--scan_lms_path', type=str, default='data/scan_3d.txt')
+    parser.add_argument('--match_save_path',
+                        type=str,
+                        default='results/match_arap_nicp.obj')
+    parser.add_argument('--remove_interior',
+                        action='store_true',
+                        help='Remove eye ball and tongue')
+    args = parser.parse_args()
 
-    scan_path_list = sorted(glob('registration/mesh/*.obj'))
-    scan_lms_path_list = sorted(
-        glob('registration/landmark/landmarks_xyz_41/*.json'))
+    template_pg_path = args.template_pg_path
+    template_pg_lm_path = args.template_pg_lm_path
+    scan_path = args.scan_path
+    scan_lms_path = args.scan_lms_path
+    match_save_path = args.match_save_path
+    remove_interior = args.remove_interior
 
-    template = read_obj(template_path)
-    lms_data = np.array(json.load(open(tempalte_landmark_path)))
-    lms_fid = np.int64(lms_data[:, 0])
-    lms_uv = np.float64(lms_data[:, 1:])
+    solve_deform_partial = partial(
+        solve_deform, **load_template(template_pg_path, template_pg_lm_path))
 
-    lms_bary_coords = np.stack(
-        [lms_uv[:, 0], lms_uv[:, 1], 1 - lms_uv[:, 0] - lms_uv[:, 1]], -1)
+    model_save = solve_deform_partial(scan_path=scan_path,
+                                      scan_lms_path=scan_lms_path)
 
-    template_lms = load_face_landmarks(template, tempalte_landmark_path)
-
-    solve_deform_partial = partial(solve_deform, template, lms_fid,
-                                   lms_bary_coords, template_lms)
-
-    for scan_path, scan_lms_path in zip(scan_path_list, scan_lms_path_list):
-
-        V_arap = solve_deform_partial(scan_path, scan_lms_path)
-
-        model_save = copy.deepcopy(template)
-        model_save.vertices = V_arap
-
-        # remove eyeball and tongue
+    # WARNING: Current implementation is surface deform only.
+    # It is prone to self-intersection and can not guarantee the interior correctness
+    # Here is the option to remove them
+    # FIXME: Implement volume ARAP
+    if remove_interior:
         fid = np.arange(len(model_save.faces_quad))
         face_group_ids = np.split(fid, model_save.polygon_groups_quad[1:])
 
@@ -170,4 +198,4 @@ if __name__ == '__main__':
         model_save.face_uvs_idx_quad = np.arange(
             len(uv_ids))[uv_unique_inverse].reshape(-1, 4)
 
-        write_obj(os.path.join('results', scan_path.split('/')[-1]), model_save)
+    write_obj(match_save_path, model_save)

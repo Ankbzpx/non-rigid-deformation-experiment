@@ -3,6 +3,9 @@ import numpy as np
 from PIL import Image
 from scipy.spatial.distance import cdist
 import json
+import argparse
+
+# Debug
 from icecream import ic
 
 
@@ -60,26 +63,51 @@ def sample_color(img, uv, mode='bilinear'):
 
 if __name__ == '__main__':
 
-    template = read_obj('results/template_icp_match.obj')
+    parser = argparse.ArgumentParser(
+        description='Save polygon group info to template model.')
+    parser.add_argument('--template_path',
+                        type=str,
+                        default='data/mastermodel_3d.obj')
+    parser.add_argument('--template_lm_path',
+                        type=str,
+                        default='data/mastermodel_3d.txt')
+    parser.add_argument('--face_sheet_path',
+                        type=str,
+                        default='data/FacialSheet_modified.png')
+    parser.add_argument('--template_save_path',
+                        type=str,
+                        default='results/template_pg.obj')
+    parser.add_argument('--template_lm_save_path',
+                        type=str,
+                        default='results/template_pg_lms.txt')
+    args = parser.parse_args()
+
+    template_path = args.template_path
+    template_lm_path = args.template_lm_path
+    face_sheet_path = args.face_sheet_path
+    template_save_path = args.template_save_path
+    template_lm_save_path = args.template_lm_save_path
+
+    template = read_obj(template_path)
 
     per_face_uv = template.uvs[template.face_uvs_idx]
     barycenter_uv = np.average(per_face_uv, 1)
 
-    facial_sheet = np.array(Image.open('data/FacialSheet_modified.png')) / 255.
+    facial_sheet = np.array(Image.open(face_sheet_path)) / 255.
     uv_color = sample_color(facial_sheet, barycenter_uv, mode='nearest')
 
     unique_color, unique_counts = np.unique(uv_color,
                                             return_counts=True,
                                             axis=0)
     unique_color = unique_color[unique_counts > 10]
-    ic(len(unique_color))
+    print(f"Number of polygon groups: {len(unique_color)}")
 
     color_idx = np.argmin(cdist(uv_color, unique_color), 1)
 
     sort_idx = np.argsort(color_idx[::2])
     sort_idx = np.stack([2 * sort_idx, 2 * sort_idx + 1], -1).reshape(-1)
 
-    template_lms_data = np.array(json.load(open('data/mastermodel_3d.txt')))
+    template_lms_data = np.array(json.load(open(template_lm_path)))
     template_lms_fid = np.int64(template_lms_data[:, 0])
     template_lms_fid = np.array([
         np.where(sort_idx == lms_fid) for lms_fid in template_lms_fid
@@ -87,7 +115,7 @@ if __name__ == '__main__':
     template_lms_uv = np.float64(template_lms_data[:, 1:]).astype(object)
     template_lms_data = np.hstack([template_lms_fid, template_lms_uv])
 
-    with open('results/template_icp_match_lms.txt', 'w') as f:
+    with open(template_lm_save_path, 'w') as f:
         json.dump(template_lms_data.tolist(), f)
 
-    write_obj('results/template_icp_match.obj', template, color_idx)
+    write_obj(template_save_path, template, color_idx)
