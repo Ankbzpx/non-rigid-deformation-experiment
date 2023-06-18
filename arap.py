@@ -5,7 +5,7 @@ import scipy.sparse.linalg
 import scipy.linalg
 from icecream import ic
 import jax.numpy as jnp
-from jax import vmap
+from jax import vmap, jit
 
 
 def boundary_condition_bary(V, F, b_fid, b_bary_coords):
@@ -235,6 +235,7 @@ class AsRigidAsPossible(LinearVertexSolver):
         Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
 
         # \sum_{j \in \mathcal{N}(i)} w_{ij} R_i (p_i - p_j)
+        @jit
         def arap_rhs(eij, eij_, e_weight):
             cov = eij_.T @ jnp.diag(e_weight) @ eij
             U, S, V_T = jnp.linalg.svd(cov)
