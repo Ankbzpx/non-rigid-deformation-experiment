@@ -94,7 +94,8 @@ def closest_point_triangle_match(verts: torch.Tensor,
     cos = torch.einsum('ab,ab->a', target_vertex_normals[indices], vert_normals)
     valid_mask = torch.logical_and(dists < dist_thr, cos > cos_thr)
     valid_mask[exclude_indices] = False
-    return valid_mask, pt_proj[valid_mask]
+
+    return valid_mask, pt_proj[valid_mask], dists[valid_mask]
 
 
 if __name__ == '__main__':
@@ -272,8 +273,8 @@ if __name__ == '__main__':
                 weight_close *= 2
                 weight_close = min(weight_close, 5e1)
 
-        valid_mask, verts_scan_closest = closest_match(verts_deformed,
-                                                       cos_thr=0.5)
+        valid_mask, verts_scan_closest, _ = closest_match(verts_deformed,
+                                                          cos_thr=0.5)
 
         for iter in range(100):
             optimizer.zero_grad()

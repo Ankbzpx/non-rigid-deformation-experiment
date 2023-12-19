@@ -84,6 +84,9 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
                              b_f_bounded=False)
     V_arap = arap.solve(scan_lms, V)
 
+    lm_dist = np.linalg.norm(scan_lms - (s * template_lms @ R.T + t), axis=1)
+    dist_thr = np.median(lm_dist)
+
     faces = torch.from_numpy(F).long().cuda()
     VF, NI = igl.vertex_triangle_adjacency(F, NV)
     vert_face_adjacency = [
@@ -98,38 +101,68 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
                             target_vertex_normals=face_normals_scan,
                             exclude_indices=exclude_indices)
 
-    def get_closest_match(verts: np.ndarray, dist_thr=5e-4, cos_thr=0.0):
-        valid_mask, pt_matched = closest_match(
+    def get_closest_match(verts: np.ndarray, dist_thr=dist_thr, cos_thr=0.0):
+        valid_mask, pt_matched, dist_closest = closest_match(
             torch.from_numpy(verts).float().cuda(),
             dist_thr=dist_thr,
             cos_thr=cos_thr)
         B = torch.where(valid_mask)[0].detach().cpu().numpy()
         BC = pt_matched.detach().cpu().numpy()
-        return B, BC
+        return B, BC, dist_closest
 
     max_iter = 20
-    dist_thrs = np.linspace(1e-3, 1e-5, max_iter)
+    dist_thrs = np.linspace(50 * dist_thr, dist_thr, max_iter)
     cos_thrs = np.linspace(0.5, 0.95, max_iter)
     closest_match_weights = np.linspace(1, 1e3, max_iter)
+    p_range = np.linspace(10, 0.4, max_iter)
     landmark_weights = np.linspace(1, 1, max_iter)
+
+    stiffness_thrs = np.linspace(10, 1, max_iter)
+    stiffness_thrs[1::2] *= np.linspace(1e-1, 1e-1, max_iter // 2)
+    stiffness_thrs[-1] = 1
 
     for i in tqdm(range(max_iter)):
         dist_thr = dist_thrs[i]
         cos_thr = cos_thrs[i]
-        b_v_weight = closest_match_weights[i]
         b_f_weight = landmark_weights[i]
-        B, BC = get_closest_match(V_arap, dist_thr=dist_thr, cos_thr=cos_thr)
+        B, BC, dist_closest = get_closest_match(V_arap,
+                                                dist_thr=dist_thr,
+                                                cos_thr=cos_thr)
+
+        # ps.init()
+        # ps.register_point_cloud('B', V_arap[B])
+        # ps.register_point_cloud('BC', BC)
+        # ps.show()
+        # exit()
+
+        # Robust weight (welsch_weight)
+        p = p_range[i]
+        base = p * dist_closest.median() / (np.sqrt(2) * 2.3)
+        weight = torch.exp(-(dist_closest / base)**2 / np.sqrt(2))
+
+        b_v_weight = weight.detach().cpu().numpy() * closest_match_weights[i]
+
+        b_v_weight /= b_v_weight.max()
+        b_v_weight *= stiffness_thrs[i]
 
         arap = AsRigidAsPossible(V,
                                  F,
                                  b_vid=B,
                                  b_v_bounded=False,
-                                 b_v_weight=b_v_weight * np.ones(len(B)),
+                                 b_v_weight=b_v_weight,
                                  b_fid=lms_fid,
                                  b_bary_coords=lms_bary_coords,
                                  b_f_bounded=False,
                                  b_f_weight=b_f_weight * np.ones(len(lms_fid)))
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
+
+        # ps.init()
+        # ps.register_surface_mesh('V_arap', V_arap, F)
+        # ps.register_surface_mesh('scan', scan.vertices, scan.faces)
+        # ps.show()
+
+        if i == 2:
+            break
 
     model_matched = copy.deepcopy(template)
     model_matched.vertices = V_arap
@@ -141,15 +174,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='ARAP + Non-rigid ICP.')
     parser.add_argument('--template_pg_path',
                         type=str,
-                        default='results/template_pg.obj')
+                        default='data/head1/template_pg.obj')
     parser.add_argument('--template_pg_lm_path',
                         type=str,
-                        default='results/template_pg_lms.txt')
-    parser.add_argument('--scan_path', type=str, default='data/scan.ply')
-    parser.add_argument('--scan_lms_path', type=str, default='data/scan_3d.txt')
+                        default='data/head1/facemesh2template.txt')
+    parser.add_argument('--scan_path', type=str, default='data/head1/head1.obj')
+    parser.add_argument('--scan_lms_path',
+                        type=str,
+                        default='data/head1/head1_landmarks.txt')
     parser.add_argument('--match_save_path',
                         type=str,
-                        default='results/match_arap_nicp.obj')
+                        default='results/head1_match_arap_nicp.obj')
     parser.add_argument('--remove_interior',
                         action='store_true',
                         help='Remove eye ball and tongue')
