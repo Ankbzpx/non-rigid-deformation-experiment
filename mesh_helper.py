@@ -168,8 +168,9 @@ def write_obj(filename, mesh: OBJMesh, face_group_id=None):
             for v, vc in zip(mesh.vertices, mesh.vertex_colors):
                 obj_file.write('v %f %f %f %f %f %f\n' %
                                (v[0], v[1], v[2], vc[0], vc[1], vc[2]))
-        for vt in mesh.uvs:
-            obj_file.write('vt %f %f\n' % (vt[0], vt[1]))
+        if mesh.uvs is not None:
+            for vt in mesh.uvs:
+                obj_file.write('vt %f %f\n' % (vt[0], vt[1]))
 
         group_counter = 0
         sort_idx = None
