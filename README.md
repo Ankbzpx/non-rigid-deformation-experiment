@@ -25,6 +25,11 @@ Match using ARAP + NICP
 python non_rigid_deformation_arap.py
 ```
 
+Match flame template using ARAP + NICP
+```
+python non_rigid_deformation_arap_flame.py
+```
+
 ## Note
 - Models are proprietary hence not included
 - Unrelated files are test code

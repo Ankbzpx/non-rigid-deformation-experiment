@@ -67,19 +67,19 @@ if __name__ == '__main__':
         description='Save polygon group info to template model.')
     parser.add_argument('--template_path',
                         type=str,
-                        default='data/mastermodel_3d.obj')
+                        default='templates/mastermodel_3d.obj')
     parser.add_argument('--template_lm_path',
                         type=str,
-                        default='data/mastermodel_3d.txt')
+                        default='templates/mastermodel_3d.txt')
     parser.add_argument('--face_sheet_path',
                         type=str,
-                        default='data/FacialSheet_modified.png')
+                        default='templates/FacialSheet_modified.png')
     parser.add_argument('--template_save_path',
                         type=str,
-                        default='results/template_pg.obj')
+                        default='templates/template_pg.obj')
     parser.add_argument('--template_lm_save_path',
                         type=str,
-                        default='results/template_pg_lms.txt')
+                        default='templates/template_pg_lms.txt')
     args = parser.parse_args()
 
     template_path = args.template_path
