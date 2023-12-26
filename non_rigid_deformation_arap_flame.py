@@ -3,7 +3,7 @@ import igl
 import json
 import numpy as np
 
-from mesh_helper import read_obj, write_obj, load_face_landmarks, OBJMesh
+from mesh_helper import OBJMesh, write_obj, OBJMesh
 from arap import AsRigidAsPossible
 import torch
 from non_rigid_deformation import closest_point_triangle_match, closest_point_on_triangle
@@ -13,21 +13,30 @@ from tqdm import tqdm
 from corase_match_svd import match_correspondence
 import copy
 from functools import partial
+import pickle
 
 # Debug
 import polyscope as ps
 from icecream import ic
 
 
-def load_template(template_path, template_lm_path):
-    template = read_obj(template_path)
-    
-    lms_data = np.load(template_lm_path)
+def load_template(flame_path, flame_mediapipe_lm_path):
+
+    with open(flame_path, 'rb') as f:
+        data = pickle.load(f, encoding="latin1")
+        V = np.float64(data['v_template'])
+        F = np.int64(data['f'])
+        VN = igl.per_vertex_normals(V, F)
+
+        template = OBJMesh(V, F, VN)
+
+    lms_data = np.load(flame_mediapipe_lm_path)
     lmk_face_idx = np.int64(lms_data['lmk_face_idx'])
     lmk_b_coords = np.float64(lms_data['lmk_b_coords'])
     landmark_indices = lms_data['landmark_indices']
 
-    template_lms = (template.vertices[template.faces][lmk_face_idx] * lmk_b_coords[..., None]).sum(1)
+    template_lms = (template.vertices[template.faces][lmk_face_idx] *
+                    lmk_b_coords[..., None]).sum(1)
 
     return {
         "template": template,
@@ -38,8 +47,33 @@ def load_template(template_path, template_lm_path):
     }
 
 
-def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms, landmark_indices,
-                 scan_path, scan_lms_path):
+def deformation_gradient(V, V_deform, F):
+    z = np.array([0., 1., 0.])[None, :]
+    FN = igl.per_face_normals(V, F, z)
+    FN_deform = igl.per_face_normals(V_deform, F, z)
+
+    per_face_verts = V[F]
+    per_face_verts_deform = V_deform[F]
+
+    V_i = np.stack([
+        per_face_verts[:, 0] - per_face_verts[:, 2],
+        per_face_verts[:, 1] - per_face_verts[:, 2], FN
+    ], -1)
+
+    V_j = np.stack([
+        per_face_verts_deform[:, 0] - per_face_verts_deform[:, 2],
+        per_face_verts_deform[:, 1] - per_face_verts_deform[:, 2], FN_deform
+    ], -1)
+
+    # Deformation gradient
+    # J @ V_i = V_j
+    J = np.einsum('bij,bjk->bik', V_j, np.linalg.inv(V_i))
+
+    return J
+
+
+def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
+                 landmark_indices, scan_path, scan_lms_path):
     scan: trimesh.Trimesh = trimesh.load(scan_path,
                                          process=False,
                                          maintain_order=True)
@@ -65,10 +99,10 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms, land
         torch.from_numpy(scan_lms).float().cuda(), per_face_verts_scan,
         face_normals_scan)[0].detach().cpu().numpy()
 
-    # 3929 
+    # 3929
     eyeball_center_l_idx = 3929
     eyeball_center_r_idx = 3930
-    
+
     # 546
     eyeball_l_idx = 3931
     eyeball_r_idx = 3931 + 546
@@ -76,10 +110,11 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms, land
     B_eyeball = np.arange(eyeball_l_idx, eyeball_r_idx + 546)
     BC_eyeball = V[B_eyeball]
 
-    eyeball_l_offset = V[eyeball_l_idx:eyeball_r_idx] - V[eyeball_center_l_idx][None, :]
+    eyeball_l_offset = V[eyeball_l_idx:eyeball_r_idx] - V[eyeball_center_l_idx][
+        None, :]
     eyeball_r_offset = V[eyeball_r_idx:] - V[eyeball_center_r_idx][None, :]
-    
-    # Ignore eyeball
+
+    # Ignore isolated eyeballs
     exclude_indices = B_eyeball
 
     arap = AsRigidAsPossible(V,
@@ -166,18 +201,20 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms, land
                                  b_f_bounded=False,
                                  b_f_weight=b_f_weight * np.ones(len(lms_fid)))
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
-        
-        ps.init()
-        ps.register_surface_mesh('V_arap', V_arap, F)
-        ps.register_surface_mesh('scan', scan.vertices, scan.faces)
-        ps.show()
+
+        # ps.init()
+        # ps.register_surface_mesh('V_arap', V_arap, F)
+        # ps.register_surface_mesh('scan', scan.vertices, scan.faces)
+        # ps.show()
 
         if i == 2:
             break
-    
-    # Recovery eyeball
-    V_arap[eyeball_l_idx:eyeball_r_idx] = eyeball_l_offset + V_arap[eyeball_center_l_idx][None, :]
-    V_arap[eyeball_r_idx:] = eyeball_r_offset + V_arap[eyeball_center_r_idx][None, :]
+
+    # Fix eyeballs. Need a better approach
+    V_arap[eyeball_l_idx:eyeball_r_idx] = eyeball_l_offset + V_arap[
+        eyeball_center_l_idx][None, :]
+    V_arap[eyeball_r_idx:] = eyeball_r_offset + V_arap[eyeball_center_r_idx][
+        None, :]
 
     model_matched = copy.deepcopy(template)
     model_matched.vertices = V_arap
@@ -187,33 +224,29 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms, land
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='ARAP + Non-rigid ICP.')
-    parser.add_argument('--template_pg_path',
+    parser.add_argument('--flame_path',
                         type=str,
-                        default='flame/flame.obj')
-    parser.add_argument('--template_pg_lm_path',
+                        default='templates/flame2023.pkl')
+    parser.add_argument('--flame_mediapipe_lm_path',
                         type=str,
-                        default='flame/mediapipe_landmark_embedding.npz')
-    parser.add_argument('--scan_path', type=str, default='flame/head1_landmark468/head1.obj')
+                        default='templates/mediapipe_landmark_embedding.npz')
+    parser.add_argument('--scan_path', type=str, default='scan_data/head1.obj')
     parser.add_argument('--scan_lms_path',
                         type=str,
-                        default='flame/head1_landmark468/head1_landmarks.txt')
+                        default='scan_data/head1_landmarks.txt')
     parser.add_argument('--match_save_path',
                         type=str,
                         default='results/head1_match_arap_nicp.obj')
-    parser.add_argument('--remove_interior',
-                        action='store_true',
-                        help='Remove eye ball and tongue')
     args = parser.parse_args()
 
-    template_pg_path = args.template_pg_path
-    template_pg_lm_path = args.template_pg_lm_path
+    flame_path = args.flame_path
+    flame_mediapipe_lm_path = args.flame_mediapipe_lm_path
     scan_path = args.scan_path
     scan_lms_path = args.scan_lms_path
     match_save_path = args.match_save_path
-    remove_interior = args.remove_interior
 
     solve_deform_partial = partial(
-        solve_deform, **load_template(template_pg_path, template_pg_lm_path))
+        solve_deform, **load_template(flame_path, flame_mediapipe_lm_path))
 
     model_save = solve_deform_partial(scan_path=scan_path,
                                       scan_lms_path=scan_lms_path)

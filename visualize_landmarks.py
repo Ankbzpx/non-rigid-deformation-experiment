@@ -10,14 +10,14 @@ from mesh_helper import read_obj, load_face_landmarks
 from non_rigid_deformation import closest_point_on_triangle
 
 if __name__ == '__main__':
-    template = read_obj('results/template_icp_match.obj')
+    template = read_obj('templates/template_pg.obj')
     template_lms = load_face_landmarks(template,
-                                       'results/template_icp_match_lms.txt')
+                                       'templates/template_pg_lms.txt')
 
-    scan: trimesh.Trimesh = trimesh.load('data/scan.ply',
+    scan: trimesh.Trimesh = trimesh.load('scan_data/scan.ply',
                                          process=False,
                                          maintain_order=True)
-    scan_lms_data = json.load(open('data/scan_3d.txt'))
+    scan_lms_data = json.load(open('scan_data/scan_3d.txt'))
     scan_lms = np.stack(
         [np.array([lm['x'], lm['y'], lm['z']]) for lm in scan_lms_data])
 
@@ -28,14 +28,14 @@ if __name__ == '__main__':
             scan.face_normals)).float().cuda())[0].detach().cpu().numpy()
 
     ps.init()
-    ps.register_surface_mesh('template',
-                             template.vertices,
-                             template.faces,
-                             enabled=False)
-    ps.register_point_cloud('template_lms',
-                            template_lms,
-                            radius=2e-3,
-                            enabled=False)
+    # ps.register_surface_mesh('template',
+    #                          template.vertices,
+    #                          template.faces,
+    #                          enabled=False)
+    # ps.register_point_cloud('template_lms',
+    #                         template_lms,
+    #                         radius=2e-3,
+    #                         enabled=False)
     ps.register_surface_mesh('scan', scan.vertices, scan.faces)
     ps.register_point_cloud('scan_lms', scan_lms, radius=2e-3)
     ps.register_point_cloud('scan_lms_proj', scan_lms_proj, radius=2e-3)

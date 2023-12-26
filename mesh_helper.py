@@ -2,7 +2,7 @@ import numpy as np
 import os
 from PIL import Image
 import trimesh
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 
 
@@ -11,15 +11,15 @@ class OBJMesh:
     vertices: np.ndarray
     faces: np.ndarray
     vertex_normals: np.ndarray
-    faces_quad: np.ndarray | None
-    uvs: np.ndarray | None
-    face_uvs_idx: np.ndarray | None
-    face_uvs_idx_quad: np.ndarray | None
-    materials: list[Image.Image]
-    vertex_colors: np.ndarray | None
-    polygon_groups: np.ndarray | None
-    polygon_groups_quad: np.ndarray | None
-    extras: list[str]
+    faces_quad: np.ndarray | None = None
+    uvs: np.ndarray | None = None
+    face_uvs_idx: np.ndarray | None = None
+    face_uvs_idx_quad: np.ndarray | None = None
+    materials: list[Image.Image] = field(default_factory=lambda: [])
+    vertex_colors: np.ndarray | None = None
+    polygon_groups: np.ndarray | None = None
+    polygon_groups_quad: np.ndarray | None = None
+    extras: list[str] = field(default_factory=lambda: [])
 
 
 # TODO: Support multiple materials, face normals

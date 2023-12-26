@@ -117,6 +117,7 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
     p_range = np.linspace(10, 0.4, max_iter)
     landmark_weights = np.linspace(1, 1, max_iter)
 
+    # Alternating between rigidity and closest point match
     stiffness_thrs = np.linspace(10, 1, max_iter)
     stiffness_thrs[1::2] *= np.linspace(1e-1, 1e-1, max_iter // 2)
     stiffness_thrs[-1] = 1
@@ -161,6 +162,7 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
         # ps.register_surface_mesh('scan', scan.vertices, scan.faces)
         # ps.show()
 
+        # Good enough...
         if i == 2:
             break
 
@@ -174,22 +176,23 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='ARAP + Non-rigid ICP.')
     parser.add_argument('--template_pg_path',
                         type=str,
-                        default='data/head1/template_pg.obj')
+                        default='templates/template_pg.obj')
     parser.add_argument('--template_pg_lm_path',
                         type=str,
-                        default='data/head1/facemesh2template.txt')
-    parser.add_argument('--scan_path', type=str, default='data/head1/head1.obj')
+                        default='templates/template_pg_lms.txt')
+    parser.add_argument('--scan_path', type=str, default='scan_data/scan.ply')
     parser.add_argument('--scan_lms_path',
                         type=str,
-                        default='data/head1/head1_landmarks.txt')
+                        default='scan_data/scan_3d.txt')
     parser.add_argument('--match_save_path',
                         type=str,
-                        default='results/head1_match_arap_nicp.obj')
+                        default='results/scan_match_arap_nicp.obj')
     parser.add_argument('--remove_interior',
                         action='store_true',
                         help='Remove eye ball and tongue')
     args = parser.parse_args()
 
+    # Template mesh with pre-specified polygon groups
     template_pg_path = args.template_pg_path
     template_pg_lm_path = args.template_pg_lm_path
     scan_path = args.scan_path
