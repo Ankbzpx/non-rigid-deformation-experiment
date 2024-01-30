@@ -4,9 +4,7 @@ import matplotlib.pyplot as plt
 from functools import partial
 import os
 import open3d as o3d
-from glob import glob
 
-# https://colab.research.google.com/github/googlesamples/mediapipe/blob/main/examples/face_landmarker/python/%5BMediaPipe_Python_Tasks%5D_Face_Landmarker.ipynb#scrollTo=s3E6NFV-00Qt
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -67,7 +65,7 @@ def reproj_loss(P, lms, lms_3d, ord=1):
 
 
 if __name__ == '__main__':
-
+    # Model from: https://developers.google.com/mediapipe/solutions/vision/face_landmarker/index#models
     base_options = python.BaseOptions(
         model_asset_path='mediapipe/face_landmarker.task')
     options = vision.FaceLandmarkerOptions(
