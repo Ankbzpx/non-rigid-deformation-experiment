@@ -19,17 +19,30 @@ import polyscope as ps
 from icecream import ic
 
 
-# Landmark in pixel coordinate
-def detect_facelandmark(detector, image):
-    H, W, _ = image.numpy_view().shape
-    face_landmarks = detector.detect(image).face_landmarks
+def mp_facelandmark_detect_init():
+    # Model from: https://developers.google.com/mediapipe/solutions/vision/face_landmarker/index#models
+    base_options = python.BaseOptions(
+        model_asset_path='mediapipe/face_landmarker.task')
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1)
+    detector = vision.FaceLandmarker.create_from_options(options)
 
-    if len(face_landmarks) == 0:
-        return np.zeros((0, 2), dtype=np.float64)
-    else:
-        # Ignore depth
-        return np.stack(
-            [np.array([lm.x * W, lm.y * H]) for lm in face_landmarks[0]])
+    # Landmark in pixel coordinate
+    def detect_facelandmark(image):
+        H, W, _ = image.numpy_view().shape
+        face_landmarks = detector.detect(image).face_landmarks
+
+        if len(face_landmarks) == 0:
+            return np.zeros((0, 2), dtype=np.float64)
+        else:
+            # Ignore depth
+            return np.stack(
+                [np.array([lm.x * W, lm.y * H]) for lm in face_landmarks[0]])
+
+    return detect_facelandmark
 
 
 def parse_calibration_data(json_path):
@@ -64,17 +77,29 @@ def reproj_loss(P, lms, lms_3d, ord=1):
     return vmap(jnp.linalg.norm, in_axes=(0, None))(lms - lms_proj, ord).mean()
 
 
+def refine_triangulation(lms_list, P_list, lms_3d):
+    # Nonlinear optimization
+    lms = jnp.stack(lms_list)
+    P = jnp.stack(P_list)
+    lms_3d = jnp.array(lms_3d)
+
+    @jit
+    def loss_residual(lms_3d):
+        return vmap(reproj_loss, in_axes=(0, 0, None))(P, lms,
+                                                       lms_3d.reshape(-1, 3))
+
+    LM = LevenbergMarquardt(loss_residual)
+    lms_3d_refined = LM.run(lms_3d.reshape(-1,)).params.reshape(-1, 3)
+
+    loss = loss_residual(lms_3d).mean()
+    loss_refined = loss_residual(lms_3d_refined).mean()
+    print(f"Loss {loss} -> {loss_refined}")
+
+    return lms_3d_refined
+
+
 if __name__ == '__main__':
-    # Model from: https://developers.google.com/mediapipe/solutions/vision/face_landmarker/index#models
-    base_options = python.BaseOptions(
-        model_asset_path='mediapipe/face_landmarker.task')
-    options = vision.FaceLandmarkerOptions(
-        base_options=base_options,
-        output_face_blendshapes=False,
-        output_facial_transformation_matrixes=False,
-        num_faces=1)
-    detector = vision.FaceLandmarker.create_from_options(options)
-    detect_lms = partial(detect_facelandmark, detector=detector)
+    detect_facelandmark = mp_facelandmark_detect_init()
 
     capture_root_folder = "scan_data/capture"
     capture_id_list = sorted(os.listdir(capture_root_folder))
@@ -91,12 +116,11 @@ if __name__ == '__main__':
 
         lms_list = []
         P_list = []
-        image_list = []
 
         for frame_id in frame_id_list[9:21]:
             image_path = os.path.join(capture_folder, f"{frame_id}.png")
             image = mp.Image.create_from_file(image_path)
-            lms = detect_lms(image=image)
+            lms = detect_facelandmark(image)
 
             if len(lms) == 478:
                 # Model matrix
@@ -106,7 +130,6 @@ if __name__ == '__main__':
 
                 lms_list.append(lms)
                 P_list.append(P)
-                image_list.append(np.copy(image.numpy_view()))
 
         # Pick two middle lm detections for triangulation initialization
         init_id_0 = len(lms_list) // 2 - 1
@@ -116,25 +139,7 @@ if __name__ == '__main__':
                                          lms_list[init_id_0].T,
                                          lms_list[init_id_1].T).T
         lms_3d = lms_homo[:, :3] / lms_homo[:, -1][:, None]
-
-        # Nonlinear optimization
-        lms = jnp.stack(lms_list)
-        P = jnp.stack(P_list)
-        lms_3d = jnp.array(lms_3d)
-
-        @jit
-        def loss_residual(lms_3d):
-            return vmap(reproj_loss,
-                        in_axes=(0, 0, None))(P, lms, lms_3d.reshape(-1, 3))
-
-        loss = loss_residual(lms_3d).mean()
-        ic(loss)
-
-        LM = LevenbergMarquardt(loss_residual)
-        lms_3d_refined = LM.run(lms_3d.reshape(-1,)).params.reshape(-1, 3)
-
-        loss_refined = loss_residual(lms_3d_refined).mean()
-        ic(loss_refined)
+        lms_3d_refined = refine_triangulation(lms_list, P_list, lms_3d)
 
         # Visualization with MVS results
         # recon_path = os.path.join(recon_folder, f"{capture_id}.ply")
@@ -151,4 +156,8 @@ if __name__ == '__main__':
         # ps.register_surface_mesh('recon', V, F)
         # ps.show()
 
-        np.save(os.path.join(capture_folder, 'lms_478.npy'), lms_3d_refined)
+        # exit()
+
+        # Ignore last 10 iris landmarks
+        np.save(os.path.join(capture_folder, 'lms_468.npy'),
+                lms_3d_refined[:468])
