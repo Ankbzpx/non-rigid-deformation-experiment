@@ -3,6 +3,7 @@ import igl
 import scipy.sparse
 import scipy.sparse.linalg
 import scipy.linalg
+import sparseqr
 from icecream import ic
 import jax.numpy as jnp
 from jax import vmap, jit
@@ -51,16 +52,53 @@ def boundary_condition(V, b_vid):
     return C, b_mask
 
 
+def reduce_full_rank(C):
+    Q, R, E, rank = sparseqr.qr(C)
+    Q = Q.tocsc()[:, :rank]
+    R = R.tocsc()
+    P = sparseqr.permutation_vector_to_matrix(E)
+
+    # Q @ R = C @ P => Q @ R @ M.T = C
+    # C @ x = d => R @ M.T @ x = Q.T @ d
+    return (R @ P.T)[:rank], lambda x: Q.T @ x
+
+
+# Replace entries in sparse matrix by coefficient weighted identity blocks
+def unroll_identity_block(A, dim):
+    H, W = A.shape
+    A_coo = scipy.sparse.coo_array(A)
+    A_unroll_row = ((dim * A_coo.row)[..., None] +
+                    np.arange(dim)[None, ...]).reshape(-1)
+    A_unroll_col = ((dim * A_coo.col)[..., None] +
+                    np.arange(dim)[None, ...]).reshape(-1)
+    A_unroll_data = np.repeat(A_coo.data, dim)
+
+    return scipy.sparse.csc_array((A_unroll_data, (A_unroll_row, A_unroll_col)),
+                                  shape=(dim * H, dim * W))
+
+
+def spsolve_unroll(A, b):
+    dim = b.shape[1]
+    return scipy.sparse.linalg.spsolve(unroll_identity_block(A, dim),
+                                       b.reshape(-1,)).reshape(-1, dim)
+
+
+def lsqr_unroll(A, b):
+    dim = b.shape[1]
+    return scipy.sparse.linalg.lsqr(unroll_identity_block(A, dim),
+                                    b.reshape(-1,))[0].reshape(-1, dim)
+
+
 class LinearVertexSolver:
     '''
     Solve C @ V = B with respect to boundary condition V_b = B_b
         Specifically, we build
-            C = [C_upper, C_b]^T
+            C = [A, C_b]^T
             B = [B, B_b]^T
         then solve
             C^T @ C @ X = C^T @ B
 
-        C_upper: objective
+        A: objective
         V: mesh vertices
         F: mesh faces
         V_weight: per vertex weight
@@ -74,7 +112,7 @@ class LinearVertexSolver:
     '''
 
     def __init__(self,
-                 C_upper: scipy.sparse.spmatrix,
+                 A: scipy.sparse.spmatrix,
                  V: np.ndarray,
                  F: np.ndarray,
                  V_weight: np.ndarray | None = None,
@@ -91,48 +129,38 @@ class LinearVertexSolver:
         else:
             V_weight = np.ones(len(V))
 
-        C_lower = []
-        weights = []
+        constraints = []
         b_mask = np.ones(len(V)).astype(bool)
         if b_vid is not None:
             C_v, b_v_mask = boundary_condition(V, b_vid)
-            C_lower.append(C_v)
-
-            if b_v_weight is not None:
-                assert len(b_v_weight) == len(b_vid)
-            else:
-                b_v_weight = np.ones(len(b_vid))
-            weights.append(b_v_weight)
+            constraints.append(C_v)
 
             if b_v_bounded:
                 b_mask = np.logical_and(b_mask, b_v_mask)
 
         if b_fid is not None:
             C_f, b_f_mask = boundary_condition_bary(V, F, b_fid, b_bary_coords)
-            C_lower.append(C_f)
-
-            if b_f_weight is not None:
-                assert len(b_f_weight) == len(b_fid)
-            else:
-                b_f_weight = np.ones(len(b_fid))
-            weights.append(b_f_weight)
+            constraints.append(C_f)
 
             if b_f_bounded:
                 b_mask = np.logical_and(b_mask, b_f_mask)
 
-        C = scipy.sparse.vstack([C_upper[b_mask]] + C_lower)
-        C_T = C.T.tocsc()
-        weights = np.concatenate([V_weight[b_mask]] + weights)
-        W = scipy.sparse.diags(weights)
+        C_T = scipy.sparse.vstack(constraints)
 
-        self.b_mask = b_mask
-        self.NBC = C.shape[0] - np.sum(b_mask)
-        self.C_T = C_T
-        self.W = W
-        self.solve_factorized = scipy.sparse.linalg.factorized(C_T @ W @ C)
+        # Use QR to reduce the rank of constraints
+        C_T, self.reduce = reduce_full_rank(C_T)
 
-    def verify_bc_dim(self, BC: np.ndarray) -> bool:
-        assert self.NBC == len(BC)
+        M = scipy.sparse.vstack([
+            scipy.sparse.hstack([A, C_T.T]),
+            scipy.sparse.hstack(
+                [C_T,
+                 scipy.sparse.csc_matrix((C_T.shape[0], C_T.shape[0]))])
+        ]).tocsc()
+
+        self.solve_factorized = scipy.sparse.linalg.factorized(M)
+
+    def solve_(self, b, d):
+        return self.solve_factorized(np.vstack([b, d]))[:len(b)]
 
 
 class BiLaplacian(LinearVertexSolver):
@@ -153,16 +181,14 @@ class BiLaplacian(LinearVertexSolver):
         M: scipy.sparse.csc_matrix = igl.massmatrix(V, F,
                                                     igl.MASSMATRIX_TYPE_VORONOI)
         M_inv = scipy.sparse.diags(1 / M.diagonal())
-        C_upper = L @ M_inv @ L
-        super().__init__(C_upper, V, F, V_weight, b_vid, b_v_bounded,
-                         b_v_weight, b_fid, b_bary_coords, b_f_bounded,
-                         b_f_weight)
-        self.B_upper = np.zeros((np.sum(self.b_mask), 3))
+        A = L @ M_inv @ L
+        super().__init__(A, V, F, V_weight, b_vid, b_v_bounded, b_v_weight,
+                         b_fid, b_bary_coords, b_f_bounded, b_f_weight)
+        self.n = len(V)
 
     def solve(self, BC: np.ndarray):
-        self.verify_bc_dim(BC)
-        B = np.vstack([self.B_upper, BC])
-        return self.solve_factorized(self.C_T @ self.W @ B)
+        d = self.reduce(BC)
+        return self.solve_(np.zeros((self.n, 3)), d)
 
 
 # https://igl.ethz.ch/projects/ARAP/arap_web.pdf
@@ -181,10 +207,9 @@ class AsRigidAsPossible(LinearVertexSolver):
                  b_f_weight: np.ndarray | None = None):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Negative diagonal
-        C_upper = -L
-        super().__init__(C_upper, V, F, V_weight, b_vid, b_v_bounded,
-                         b_v_weight, b_fid, b_bary_coords, b_f_bounded,
-                         b_f_weight)
+        A = -L
+        super().__init__(A, V, F, V_weight, b_vid, b_v_bounded, b_v_weight,
+                         b_fid, b_bary_coords, b_f_bounded, b_f_weight)
         # get one-ring neighbour from cotangent matrix
         V_cot_adj_coo = scipy.sparse.coo_array(L)
         valid_entries_mask = V_cot_adj_coo.col != V_cot_adj_coo.row
@@ -222,13 +247,11 @@ class AsRigidAsPossible(LinearVertexSolver):
               BC: np.ndarray,
               V_arap: np.ndarray,
               max_iters=8) -> np.ndarray:
-        self.verify_bc_dim(BC)
+        d = self.reduce(BC)
         for _ in range(max_iters):
             # minimize R
-            B_upper = self.build_arap_rhs(V_arap)[self.b_mask]
-            B = np.vstack([B_upper, BC])
-            # minimize V
-            V_arap = self.solve_factorized(self.C_T @ self.W @ B)
+            b = self.build_arap_rhs(V_arap)
+            V_arap = self.solve_(b, d)
         return V_arap
 
     def build_arap_rhs(self, V_arap: np.ndarray) -> np.ndarray:
