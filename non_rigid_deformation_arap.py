@@ -77,11 +77,7 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
         torch.from_numpy(scan_lms).float().cuda(), per_face_verts_scan,
         face_normals_scan)[0].detach().cpu().numpy()
 
-    arap = AsRigidAsPossible(V,
-                             F,
-                             b_fid=lms_fid,
-                             b_bary_coords=lms_bary_coords,
-                             b_f_bounded=False)
+    arap = AsRigidAsPossible(V, F, b_fid=lms_fid, b_bary_coords=lms_bary_coords)
     V_arap = arap.solve(scan_lms, V)
 
     lm_dist = np.linalg.norm(scan_lms - (s * template_lms @ R.T + t), axis=1)
@@ -113,19 +109,10 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
     max_iter = 20
     dist_thrs = np.linspace(50 * dist_thr, dist_thr, max_iter)
     cos_thrs = np.linspace(0.5, 0.95, max_iter)
-    closest_match_weights = np.linspace(1, 1e3, max_iter)
-    p_range = np.linspace(10, 0.4, max_iter)
-    landmark_weights = np.linspace(1, 1, max_iter)
-
-    # Alternating between rigidity and closest point match
-    stiffness_thrs = np.linspace(10, 1, max_iter)
-    stiffness_thrs[1::2] *= np.linspace(1e-1, 1e-1, max_iter // 2)
-    stiffness_thrs[-1] = 1
 
     for i in tqdm(range(max_iter)):
         dist_thr = dist_thrs[i]
         cos_thr = cos_thrs[i]
-        b_f_weight = landmark_weights[i]
         B, BC, dist_closest = get_closest_match(V_arap,
                                                 dist_thr=dist_thr,
                                                 cos_thr=cos_thr)
@@ -136,31 +123,18 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
         # ps.show()
         # exit()
 
-        # Robust weight (welsch_weight)
-        p = p_range[i]
-        base = p * dist_closest.median() / (np.sqrt(2) * 2.3)
-        weight = torch.exp(-(dist_closest / base)**2 / np.sqrt(2))
-
-        b_v_weight = weight.detach().cpu().numpy() * closest_match_weights[i]
-
-        b_v_weight /= b_v_weight.max()
-        b_v_weight *= stiffness_thrs[i]
-
+        # TODO: Stiffness weighting (V_weight)
         arap = AsRigidAsPossible(V,
                                  F,
                                  b_vid=B,
-                                 b_v_bounded=False,
-                                 b_v_weight=b_v_weight,
                                  b_fid=lms_fid,
-                                 b_bary_coords=lms_bary_coords,
-                                 b_f_bounded=False,
-                                 b_f_weight=b_f_weight * np.ones(len(lms_fid)))
+                                 b_bary_coords=lms_bary_coords)
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
 
-        # ps.init()
-        # ps.register_surface_mesh('V_arap', V_arap, F)
-        # ps.register_surface_mesh('scan', scan.vertices, scan.faces)
-        # ps.show()
+        ps.init()
+        ps.register_surface_mesh('V_arap', V_arap, F)
+        ps.register_surface_mesh('scan', scan.vertices, scan.faces)
+        ps.show()
 
         # Good enough...
         if i == 2:

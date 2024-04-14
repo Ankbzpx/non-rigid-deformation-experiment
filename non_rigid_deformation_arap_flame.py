@@ -121,8 +121,7 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
                              F,
                              b_vid=B_eyeball,
                              b_fid=lms_fid,
-                             b_bary_coords=lms_bary_coords,
-                             b_f_bounded=False)
+                             b_bary_coords=lms_bary_coords)
     V_arap = arap.solve(np.vstack([BC_eyeball, scan_lms]), V)
 
     lm_dist = np.linalg.norm(scan_lms - (s * template_lms @ R.T + t), axis=1)
@@ -154,18 +153,10 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
     max_iter = 20
     dist_thrs = np.linspace(50 * dist_thr, dist_thr, max_iter)
     cos_thrs = np.linspace(0.5, 0.95, max_iter)
-    closest_match_weights = np.linspace(1, 1e3, max_iter)
-    p_range = np.linspace(10, 0.4, max_iter)
-    landmark_weights = np.linspace(1, 1, max_iter)
-
-    stiffness_thrs = np.linspace(10, 1, max_iter)
-    stiffness_thrs[1::2] *= np.linspace(1e-1, 1e-1, max_iter // 2)
-    stiffness_thrs[-1] = 1
 
     for i in tqdm(range(max_iter)):
         dist_thr = dist_thrs[i]
         cos_thr = cos_thrs[i]
-        b_f_weight = landmark_weights[i]
         B, BC, dist_closest = get_closest_match(V_arap,
                                                 dist_thr=dist_thr,
                                                 cos_thr=cos_thr)
@@ -176,30 +167,15 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
         # ps.show()
         # exit()
 
-        # Robust weight (welsch_weight)
-        p = p_range[i]
-        base = p * dist_closest.median() / (np.sqrt(2) * 2.3)
-        weight = torch.exp(-(dist_closest / base)**2 / np.sqrt(2))
-
-        b_v_weight = weight.detach().cpu().numpy() * closest_match_weights[i]
-
-        b_v_weight /= b_v_weight.max()
-        b_v_weight *= stiffness_thrs[i]
-
         # Append eyeball
         B = np.concatenate([B_eyeball, B])
         BC = np.vstack([BC_eyeball, BC])
-        b_v_weight = np.concatenate([np.ones(len(B_eyeball)), b_v_weight])
 
         arap = AsRigidAsPossible(V,
                                  F,
                                  b_vid=B,
-                                 b_v_bounded=False,
-                                 b_v_weight=b_v_weight,
                                  b_fid=lms_fid,
-                                 b_bary_coords=lms_bary_coords,
-                                 b_f_bounded=False,
-                                 b_f_weight=b_f_weight * np.ones(len(lms_fid)))
+                                 b_bary_coords=lms_bary_coords)
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
 
         # ps.init()

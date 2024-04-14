@@ -77,12 +77,8 @@ class LinearVertexSolver:
         F: mesh faces
         V_weight: per vertex weight
         b_vid: vertex boundary index
-        b_v_bounded: whether to exclude vertex boundary from objective
-        b_v_weight: vertex boundary weights
         b_fid: boundary faces
         b_bary_coords: barycentric coordinate for each boundary face
-        b_f_bounded: whether to exclude barycentric boundary from objective
-        b_f_weight: barycentric boundary weights
     '''
 
     def __init__(self,
@@ -91,12 +87,8 @@ class LinearVertexSolver:
                  F: np.ndarray,
                  V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
-                 b_v_bounded=True,
-                 b_v_weight: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None,
-                 b_f_bounded=True,
-                 b_f_weight: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None):
 
         if V_weight is not None:
             assert len(V_weight) == len(V)
@@ -104,20 +96,13 @@ class LinearVertexSolver:
             V_weight = np.ones(len(V))
 
         constraints = []
-        b_mask = np.ones(len(V)).astype(bool)
         if b_vid is not None:
             C_v, b_v_mask = boundary_condition(V, b_vid)
             constraints.append(C_v)
 
-            if b_v_bounded:
-                b_mask = np.logical_and(b_mask, b_v_mask)
-
         if b_fid is not None:
             C_f, b_f_mask = boundary_condition_bary(V, F, b_fid, b_bary_coords)
             constraints.append(C_f)
-
-            if b_f_bounded:
-                b_mask = np.logical_and(b_mask, b_f_mask)
 
         C_T = scipy.sparse.vstack(constraints)
 
@@ -146,20 +131,16 @@ class BiLaplacian(LinearVertexSolver):
                  F: np.ndarray,
                  V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
-                 b_v_bounded=True,
-                 b_v_weight: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None,
-                 b_f_bounded=True,
-                 b_f_weight: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Hybrid voronoi that guarantees positive area
         M: scipy.sparse.csc_matrix = igl.massmatrix(V, F,
                                                     igl.MASSMATRIX_TYPE_VORONOI)
         M_inv = scipy.sparse.diags(1 / M.diagonal())
         A = L @ M_inv @ L
-        super().__init__(A, V, F, V_weight, b_vid, b_v_bounded, b_v_weight,
-                         b_fid, b_bary_coords, b_f_bounded, b_f_weight)
+        super().__init__(A, V, F, V_weight, b_vid,
+                         b_fid, b_bary_coords)
         self.n = len(V)
 
     def solve(self, BC: np.ndarray):
@@ -175,17 +156,13 @@ class AsRigidAsPossible(LinearVertexSolver):
                  F: np.ndarray,
                  V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
-                 b_v_bounded=True,
-                 b_v_weight: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None,
-                 b_f_bounded=True,
-                 b_f_weight: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Negative diagonal
         A = -L
-        super().__init__(A, V, F, V_weight, b_vid, b_v_bounded, b_v_weight,
-                         b_fid, b_bary_coords, b_f_bounded, b_f_weight)
+        super().__init__(A, V, F, V_weight, b_vid,
+                         b_fid, b_bary_coords)
         # get one-ring neighbour from cotangent matrix
         V_cot_adj_coo = scipy.sparse.coo_array(L)
         valid_entries_mask = V_cot_adj_coo.col != V_cot_adj_coo.row
