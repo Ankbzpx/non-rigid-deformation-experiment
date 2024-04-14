@@ -63,32 +63,6 @@ def reduce_full_rank(C):
     return (R @ P.T)[:rank], lambda x: Q.T @ x
 
 
-# Replace entries in sparse matrix by coefficient weighted identity blocks
-def unroll_identity_block(A, dim):
-    H, W = A.shape
-    A_coo = scipy.sparse.coo_array(A)
-    A_unroll_row = ((dim * A_coo.row)[..., None] +
-                    np.arange(dim)[None, ...]).reshape(-1)
-    A_unroll_col = ((dim * A_coo.col)[..., None] +
-                    np.arange(dim)[None, ...]).reshape(-1)
-    A_unroll_data = np.repeat(A_coo.data, dim)
-
-    return scipy.sparse.csc_array((A_unroll_data, (A_unroll_row, A_unroll_col)),
-                                  shape=(dim * H, dim * W))
-
-
-def spsolve_unroll(A, b):
-    dim = b.shape[1]
-    return scipy.sparse.linalg.spsolve(unroll_identity_block(A, dim),
-                                       b.reshape(-1,)).reshape(-1, dim)
-
-
-def lsqr_unroll(A, b):
-    dim = b.shape[1]
-    return scipy.sparse.linalg.lsqr(unroll_identity_block(A, dim),
-                                    b.reshape(-1,))[0].reshape(-1, dim)
-
-
 class LinearVertexSolver:
     '''
     Solve C @ V = B with respect to boundary condition V_b = B_b
@@ -150,17 +124,19 @@ class LinearVertexSolver:
         # Use QR to reduce the rank of constraints
         C_T, self.reduce = reduce_full_rank(C_T)
 
+        W = scipy.sparse.diags(V_weight)
         M = scipy.sparse.vstack([
-            scipy.sparse.hstack([A, C_T.T]),
+            scipy.sparse.hstack([W @ A, C_T.T]),
             scipy.sparse.hstack(
                 [C_T,
                  scipy.sparse.csc_matrix((C_T.shape[0], C_T.shape[0]))])
         ]).tocsc()
+        self.W = W
 
         self.solve_factorized = scipy.sparse.linalg.factorized(M)
 
     def solve_(self, b, d):
-        return self.solve_factorized(np.vstack([b, d]))[:len(b)]
+        return self.solve_factorized(np.vstack([self.W @ b, d]))[:len(b)]
 
 
 class BiLaplacian(LinearVertexSolver):
