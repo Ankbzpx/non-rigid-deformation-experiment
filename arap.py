@@ -63,14 +63,16 @@ def reduce_full_rank(C):
     return (R @ P.T)[:rank], lambda x: Q.T @ x
 
 
+# TODO: Implement simultaneous hard and soft constraints
 class LinearVertexSolver:
     '''
     Solve C @ V = B with respect to boundary condition V_b = B_b
-        Specifically, we build
-            C = [A, C_b]^T
-            B = [B, B_b]^T
-        then solve
-            C^T @ C @ X = C^T @ B
+        For hard constraints, we use Lagrange multiplier
+        For soft constraints, we build
+                M = [A, C]^T
+                B = [b, d]^T
+            then solve
+                M^T @ M @ X = M^T @ B
 
         A: objective
         V: mesh vertices
@@ -79,6 +81,8 @@ class LinearVertexSolver:
         b_vid: vertex boundary index
         b_fid: boundary faces
         b_bary_coords: barycentric coordinate for each boundary face
+        soft_weight: treat as soft constraint if the weight is larger than 0
+        soft_exclude: exclude soft constraints in primary objective
     '''
 
     def __init__(self,
@@ -88,7 +92,9 @@ class LinearVertexSolver:
                  V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None,
+                 soft_weight: float = 0.,
+                 soft_exclude: bool = True):
 
         if V_weight is not None:
             assert len(V_weight) == len(V)
@@ -96,32 +102,55 @@ class LinearVertexSolver:
             V_weight = np.ones(len(V))
 
         constraints = []
+        b_mask = np.ones(len(V)).astype(bool)
         if b_vid is not None:
             C_v, b_v_mask = boundary_condition(V, b_vid)
             constraints.append(C_v)
+
+            if soft_exclude:
+                b_mask = np.logical_and(b_mask, b_v_mask)
 
         if b_fid is not None:
             C_f, b_f_mask = boundary_condition_bary(V, F, b_fid, b_bary_coords)
             constraints.append(C_f)
 
+            if soft_exclude:
+                b_mask = np.logical_and(b_mask, b_f_mask)
+
         C_T = scipy.sparse.vstack(constraints)
 
-        # Use QR to reduce the rank of constraints
-        C_T, self.reduce = reduce_full_rank(C_T)
+        self.is_soft = soft_weight > 0
+        if self.is_soft:
+            M = scipy.sparse.vstack([A[b_mask], C_T])
+            M_T = M.T.tocsc()
+            W = scipy.sparse.diags(
+                np.concatenate([V_weight, soft_weight * np.ones(C_T.shape[0])]))
 
-        W = scipy.sparse.diags(V_weight)
-        M = scipy.sparse.vstack([
-            scipy.sparse.hstack([W @ A, C_T.T]),
-            scipy.sparse.hstack(
-                [C_T,
-                 scipy.sparse.csc_matrix((C_T.shape[0], C_T.shape[0]))])
-        ]).tocsc()
-        self.W = W
+            self.solve_factorized = scipy.sparse.linalg.factorized(M_T @ M)
+            self.M_T = M_T
+            self.W = W
+            self.b_mask = b_mask
+        else:
+            # Use QR to reduce the rank of constraints
+            C_T, self.reduce = reduce_full_rank(C_T)
+            W = scipy.sparse.diags(V_weight)
+            M = scipy.sparse.vstack([
+                scipy.sparse.hstack([W @ A, C_T.T]),
+                scipy.sparse.hstack([
+                    C_T,
+                    scipy.sparse.csc_matrix((C_T.shape[0], C_T.shape[0]))
+                ])
+            ]).tocsc()
+            self.W = W
+            self.solve_factorized = scipy.sparse.linalg.factorized(M)
 
-        self.solve_factorized = scipy.sparse.linalg.factorized(M)
-
-    def solve_(self, b, d):
-        return self.solve_factorized(np.vstack([self.W @ b, d]))[:len(b)]
+    def solve_(self, b, BC):
+        if self.is_soft:
+            return self.solve_factorized(
+                self.M_T @ np.vstack([b[self.b_mask], BC]))
+        else:
+            d = self.reduce(BC)
+            return self.solve_factorized(np.vstack([self.W @ b, d]))[:len(b)]
 
 
 class BiLaplacian(LinearVertexSolver):
@@ -132,19 +161,21 @@ class BiLaplacian(LinearVertexSolver):
                  V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None,
+                 soft_weight: float = 0.,
+                 soft_exclude: bool = True):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Hybrid voronoi that guarantees positive area
         M: scipy.sparse.csc_matrix = igl.massmatrix(V, F,
                                                     igl.MASSMATRIX_TYPE_VORONOI)
         M_inv = scipy.sparse.diags(1 / M.diagonal())
         A = L @ M_inv @ L
-        super().__init__(A, V, F, V_weight, b_vid, b_fid, b_bary_coords)
+        super().__init__(A, V, F, V_weight, b_vid, b_fid, b_bary_coords,
+                         soft_weight, soft_exclude)
         self.n = len(V)
 
     def solve(self, BC: np.ndarray):
-        d = self.reduce(BC)
-        return self.solve_(np.zeros((self.n, 3)), d)
+        return self.solve_(np.zeros((self.n, 3)), BC)
 
 
 @jit
@@ -186,7 +217,9 @@ def arap_rhs(R_i, R_j, eij, e_weight):
             jnp.einsum('bn,bmn->bm', eij, R_i + R_j)).sum(0)
 
 
-# https://igl.ethz.ch/projects/ARAP/arap_web.pdf
+# ARAP: https://igl.ethz.ch/projects/ARAP/arap_web.pdf
+# SR-ARAP: https://zoharl3.github.io/publ/arap.pdf
+# TODO: Implement triangle edge sets for SR-ARAP
 class AsRigidAsPossible(LinearVertexSolver):
 
     def __init__(self,
@@ -195,11 +228,15 @@ class AsRigidAsPossible(LinearVertexSolver):
                  V_weight: np.ndarray | None = None,
                  b_vid: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None):
+                 b_bary_coords: np.ndarray | None = None,
+                 soft_weight: float = 0.,
+                 soft_exclude: bool = True,
+                 smooth_rotation=False):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Negative diagonal
         A = -L
-        super().__init__(A, V, F, V_weight, b_vid, b_fid, b_bary_coords)
+        super().__init__(A, V, F, V_weight, b_vid, b_fid, b_bary_coords,
+                         soft_weight, soft_exclude)
         # get one-ring neighbour from cotangent matrix
         V_cot_adj_coo = scipy.sparse.coo_array(L)
         valid_entries_mask = V_cot_adj_coo.col != V_cot_adj_coo.row
@@ -233,71 +270,36 @@ class AsRigidAsPossible(LinearVertexSolver):
         self.E_j = E_j
         self.E_weight = jnp.array(E_weight)
 
-    def solve(self,
-              BC: np.ndarray,
-              V_arap: np.ndarray,
-              max_iters=8) -> np.ndarray:
-        d = self.reduce(BC)
-        for _ in range(max_iters):
-            # minimize R
-            b = self.build_arap_rhs(V_arap)
-            V_arap = self.solve_(b, d)
-        return V_arap
-
-    def build_arap_rhs(self, V_arap: np.ndarray) -> np.ndarray:
-        Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
-
-        Rs = vmap(fit_R)(self.Eij, Eij_, self.E_weight)
-        Rs_i = Rs[self.E_i]
-        Rs_j = Rs[self.E_j]
-
-        RHS = vmap(arap_rhs)(Rs_i, Rs_j, self.Eij, self.E_weight)
-        return np.asarray(RHS)
-
-
-# https://zoharl3.github.io/publ/arap.pdf
-# TODO: Use triangle edge set
-class SmoothRotationEnhancedAsRigidAsPossible(AsRigidAsPossible):
-
-    def __init__(self,
-                 V: np.ndarray,
-                 F: np.ndarray,
-                 V_weight: np.ndarray | None = None,
-                 b_vid: np.ndarray | None = None,
-                 b_fid: np.ndarray | None = None,
-                 b_bary_coords: np.ndarray | None = None):
-        super().__init__(V, F, V_weight, b_vid, b_fid, b_bary_coords)
-
-        # To make it invariant to global scaling
-        self.A = igl.doublearea(V, F).sum() / 2
-        self.Rs = np.repeat(np.eye(3)[None, ...], len(V), axis=0)
+        self.smooth_rotation = smooth_rotation
+        if smooth_rotation:
+            self.A = igl.doublearea(V, F).sum() / 2
+            self.Rs = np.repeat(np.eye(3)[None, ...], len(V), axis=0)
 
     def solve(self,
               BC: np.ndarray,
               V_arap: np.ndarray,
               max_iters=8,
               alpha=1e-5) -> np.ndarray:
-        d = self.reduce(BC)
         for _ in range(max_iters):
             # minimize R
             b = self.build_arap_rhs(V_arap, alpha)
-            V_arap = self.solve_(b, d)
+            V_arap = self.solve_(b, BC)
         return V_arap
 
-    def build_arap_rhs(self, V_arap: np.ndarray, alpha) -> np.ndarray:
-
+    def build_arap_rhs(self, V_arap: np.ndarray, alpha: float) -> np.ndarray:
         Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
 
-        # Smooth rotation
-        self.Rs = vmap(fit_R_SR, in_axes=(0, 0, 0, 0, None))(self.Eij, Eij_,
-                                                             self.E_weight,
-                                                             self.Rs[self.E_j],
-                                                             alpha * self.A)
+        if self.smooth_rotation:
+            self.Rs = vmap(fit_R_SR,
+                           in_axes=(0, 0, 0, 0,
+                                    None))(self.Eij, Eij_, self.E_weight,
+                                           self.Rs[self.E_j], alpha * self.A)
+        else:
+            self.Rs = vmap(fit_R)(self.Eij, Eij_, self.E_weight)
+
         Rs_i = self.Rs[self.E_i]
         Rs_j = self.Rs[self.E_j]
-
         RHS = vmap(arap_rhs)(Rs_i, Rs_j, self.Eij, self.E_weight)
-
         return np.asarray(RHS)
 
 
@@ -350,10 +352,11 @@ if __name__ == '__main__':
                              b_bary_coords=bary_coords)
     V_arap = arap.solve(BC, V_init)
 
-    sr_arap = SmoothRotationEnhancedAsRigidAsPossible(V,
-                                                      F,
-                                                      b_fid=boundary_fid,
-                                                      b_bary_coords=bary_coords)
+    sr_arap = AsRigidAsPossible(V,
+                                F,
+                                b_fid=boundary_fid,
+                                b_bary_coords=bary_coords,
+                                smooth_rotation=True)
     V_sr_arap = sr_arap.solve(BC, V_init)
 
     ps.init()
