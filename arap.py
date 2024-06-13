@@ -139,13 +139,51 @@ class BiLaplacian(LinearVertexSolver):
                                                     igl.MASSMATRIX_TYPE_VORONOI)
         M_inv = scipy.sparse.diags(1 / M.diagonal())
         A = L @ M_inv @ L
-        super().__init__(A, V, F, V_weight, b_vid,
-                         b_fid, b_bary_coords)
+        super().__init__(A, V, F, V_weight, b_vid, b_fid, b_bary_coords)
         self.n = len(V)
 
     def solve(self, BC: np.ndarray):
         d = self.reduce(BC)
         return self.solve_(np.zeros((self.n, 3)), d)
+
+
+@jit
+def fit_R(eij, eij_, e_weight):
+    cov = eij_.T @ jnp.diag(e_weight) @ eij
+    U, S, V_T = jnp.linalg.svd(cov)
+    R = U @ V_T
+
+    # Handle reflection
+    E = jnp.eye(len(cov))
+    min_idx = jnp.argmin(S)
+    E = E.at[min_idx, min_idx].set(jnp.sign(jnp.linalg.det(R)))
+    R = U @ E @ V_T
+
+    return R
+
+
+@jit
+def fit_R_SR(eij, eij_, e_weight, R_j, alpha=0.01):
+    cov = eij_.T @ jnp.diag(e_weight) @ eij
+    cov = cov + 2 * alpha * (e_weight[:, None, None] * R_j).sum(0)
+
+    U, S, V_T = jnp.linalg.svd(cov)
+    R = U @ V_T
+
+    # Handle reflection
+    E = jnp.eye(len(cov))
+    min_idx = jnp.argmin(S)
+    E = E.at[min_idx, min_idx].set(jnp.sign(jnp.linalg.det(R)))
+    R = U @ E @ V_T
+
+    return R
+
+
+# \sum_{j \in \mathcal{N}(i)} 0.5 * w_{ij} (R_i + R_j) @ (p_i - p_j)
+@jit
+def arap_rhs(R_i, R_j, eij, e_weight):
+    return (0.5 * e_weight[:, None] *
+            jnp.einsum('bn,bmn->bm', eij, R_i + R_j)).sum(0)
 
 
 # https://igl.ethz.ch/projects/ARAP/arap_web.pdf
@@ -161,8 +199,7 @@ class AsRigidAsPossible(LinearVertexSolver):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Negative diagonal
         A = -L
-        super().__init__(A, V, F, V_weight, b_vid,
-                         b_fid, b_bary_coords)
+        super().__init__(A, V, F, V_weight, b_vid, b_fid, b_bary_coords)
         # get one-ring neighbour from cotangent matrix
         V_cot_adj_coo = scipy.sparse.coo_array(L)
         valid_entries_mask = V_cot_adj_coo.col != V_cot_adj_coo.row
@@ -210,22 +247,57 @@ class AsRigidAsPossible(LinearVertexSolver):
     def build_arap_rhs(self, V_arap: np.ndarray) -> np.ndarray:
         Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
 
-        # \sum_{j \in \mathcal{N}(i)} w_{ij} R_i (p_i - p_j)
-        @jit
-        def arap_rhs(eij, eij_, e_weight):
-            cov = eij_.T @ jnp.diag(e_weight) @ eij
-            U, S, V_T = jnp.linalg.svd(cov)
-            R = U @ V_T
+        Rs = vmap(fit_R)(self.Eij, Eij_, self.E_weight)
+        Rs_i = Rs[self.E_i]
+        Rs_j = Rs[self.E_j]
 
-            # Handle reflection
-            E = jnp.eye(len(cov))
-            min_idx = jnp.argmin(S)
-            E = E.at[min_idx, min_idx].set(jnp.sign(jnp.linalg.det(R)))
-            R = U @ E @ V_T
+        RHS = vmap(arap_rhs)(Rs_i, Rs_j, self.Eij, self.E_weight)
+        return np.asarray(RHS)
 
-            return (e_weight[:, None] * eij @ R.T).sum(0)
 
-        RHS = vmap(arap_rhs)(self.Eij, Eij_, self.E_weight)
+# https://zoharl3.github.io/publ/arap.pdf
+# TODO: Use triangle edge set
+class SmoothRotationEnhancedAsRigidAsPossible(AsRigidAsPossible):
+
+    def __init__(self,
+                 V: np.ndarray,
+                 F: np.ndarray,
+                 V_weight: np.ndarray | None = None,
+                 b_vid: np.ndarray | None = None,
+                 b_fid: np.ndarray | None = None,
+                 b_bary_coords: np.ndarray | None = None):
+        super().__init__(V, F, V_weight, b_vid, b_fid, b_bary_coords)
+
+        # To make it invariant to global scaling
+        self.A = igl.doublearea(V, F).sum() / 2
+        self.Rs = np.repeat(np.eye(3)[None, ...], len(V), axis=0)
+
+    def solve(self,
+              BC: np.ndarray,
+              V_arap: np.ndarray,
+              max_iters=8,
+              alpha=1e-5) -> np.ndarray:
+        d = self.reduce(BC)
+        for _ in range(max_iters):
+            # minimize R
+            b = self.build_arap_rhs(V_arap, alpha)
+            V_arap = self.solve_(b, d)
+        return V_arap
+
+    def build_arap_rhs(self, V_arap: np.ndarray, alpha) -> np.ndarray:
+
+        Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
+
+        # Smooth rotation
+        self.Rs = vmap(fit_R_SR, in_axes=(0, 0, 0, 0, None))(self.Eij, Eij_,
+                                                             self.E_weight,
+                                                             self.Rs[self.E_j],
+                                                             alpha * self.A)
+        Rs_i = self.Rs[self.E_i]
+        Rs_j = self.Rs[self.E_j]
+
+        RHS = vmap(arap_rhs)(Rs_i, Rs_j, self.Eij, self.E_weight)
+
         return np.asarray(RHS)
 
 
@@ -260,8 +332,8 @@ if __name__ == '__main__':
     BC = (per_face_vertex[boundary_fid] * bary_coords[..., None]).sum(1)
 
     # deformation transformation
-    R_deform = Rotation.from_rotvec(np.array([0, 0, 2 * np.pi / 3])).as_matrix()
-    t_deform = np.array([0, -10, -10])
+    R_deform = Rotation.from_rotvec(np.array([np.pi, 0, 0])).as_matrix()
+    t_deform = np.array([0, -20, 120])
 
     BC_split = np.sum(handle_ids_0_f_mask)
     BC[BC_split:] = BC[BC_split:] @ R_deform.T + t_deform
@@ -278,8 +350,15 @@ if __name__ == '__main__':
                              b_bary_coords=bary_coords)
     V_arap = arap.solve(BC, V_init)
 
+    sr_arap = SmoothRotationEnhancedAsRigidAsPossible(V,
+                                                      F,
+                                                      b_fid=boundary_fid,
+                                                      b_bary_coords=bary_coords)
+    V_sr_arap = sr_arap.solve(BC, V_init)
+
     ps.init()
     ps.register_surface_mesh('bar', V, F, enabled=False)
     ps.register_surface_mesh('bar_init', V_init, F, enabled=False)
     ps.register_surface_mesh('bar_arap', V_arap, F)
+    ps.register_surface_mesh('bar_arap_sr', V_sr_arap, F)
     ps.show()
