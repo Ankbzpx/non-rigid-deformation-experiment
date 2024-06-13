@@ -119,12 +119,14 @@ class LinearVertexSolver:
 
         C_T = scipy.sparse.vstack(constraints)
 
-        self.is_soft = soft_weight > 0
+        if isinstance(soft_weight, float) or isinstance(soft_weight, int):
+            soft_weight = soft_weight * np.ones(C_T.shape[0])
+
+        self.is_soft = soft_weight.sum() > 0
         if self.is_soft:
             M = scipy.sparse.vstack([A[b_mask], C_T])
             M_T = M.T.tocsc()
-            W = scipy.sparse.diags(
-                np.concatenate([V_weight, soft_weight * np.ones(C_T.shape[0])]))
+            W = scipy.sparse.diags(np.concatenate([V_weight, soft_weight]))
 
             self.solve_factorized = scipy.sparse.linalg.factorized(M_T @ M)
             self.M_T = M_T
@@ -162,7 +164,7 @@ class BiLaplacian(LinearVertexSolver):
                  b_vid: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
                  b_bary_coords: np.ndarray | None = None,
-                 soft_weight: float = 0.,
+                 soft_weight: float | np.ndarray = 0.,
                  soft_exclude: bool = True):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Hybrid voronoi that guarantees positive area
@@ -229,7 +231,7 @@ class AsRigidAsPossible(LinearVertexSolver):
                  b_vid: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
                  b_bary_coords: np.ndarray | None = None,
-                 soft_weight: float = 0.,
+                 soft_weight: np.ndarray | float = 0.,
                  soft_exclude: bool = True,
                  smooth_rotation=False):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)

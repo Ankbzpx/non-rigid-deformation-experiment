@@ -77,11 +77,17 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
         torch.from_numpy(scan_lms).float().cuda(), per_face_verts_scan,
         face_normals_scan)[0].detach().cpu().numpy()
 
-    arap = AsRigidAsPossible(V, F, b_fid=lms_fid, b_bary_coords=lms_bary_coords)
+    # It is already the closest projection to surface, a.k.a. n_q @ (p - q) = p - q
+    # So setting soft BC to q is exactly minimizing the point to plane distance
+    arap = AsRigidAsPossible(V,
+                             F,
+                             b_fid=lms_fid,
+                             b_bary_coords=lms_bary_coords,
+                             smooth_rotation=True)
     V_arap = arap.solve(scan_lms, V)
 
     lm_dist = np.linalg.norm(scan_lms - (s * template_lms @ R.T + t), axis=1)
-    dist_thr = np.median(lm_dist)
+    dist_thr_median = np.median(lm_dist)
 
     faces = torch.from_numpy(F).long().cuda()
     VF, NI = igl.vertex_triangle_adjacency(F, NV)
@@ -97,7 +103,7 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
                             target_vertex_normals=face_normals_scan,
                             exclude_indices=exclude_indices)
 
-    def get_closest_match(verts: np.ndarray, dist_thr=dist_thr, cos_thr=0.0):
+    def get_closest_match(verts: np.ndarray, dist_thr, cos_thr):
         valid_mask, pt_matched, dist_closest = closest_match(
             torch.from_numpy(verts).float().cuda(),
             dist_thr=dist_thr,
@@ -107,7 +113,7 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
         return B, BC, dist_closest
 
     max_iter = 20
-    dist_thrs = np.linspace(50 * dist_thr, dist_thr, max_iter)
+    dist_thrs = np.linspace(50 * dist_thr_median, dist_thr_median, max_iter)
     cos_thrs = np.linspace(0.5, 0.95, max_iter)
 
     for i in tqdm(range(max_iter)):
@@ -128,17 +134,16 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
                                  F,
                                  b_vid=B,
                                  b_fid=lms_fid,
-                                 b_bary_coords=lms_bary_coords)
+                                 b_bary_coords=lms_bary_coords,
+                                 soft_weight=100,
+                                 soft_exclude=False,
+                                 smooth_rotation=True)
         V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
 
-        ps.init()
-        ps.register_surface_mesh('V_arap', V_arap, F)
-        ps.register_surface_mesh('scan', scan.vertices, scan.faces)
-        ps.show()
-
-        # Good enough...
-        if i == 2:
-            break
+        # ps.init()
+        # ps.register_surface_mesh('V_arap', V_arap, F)
+        # ps.register_surface_mesh('scan', scan.vertices, scan.faces)
+        # ps.show()
 
     model_matched = copy.deepcopy(template)
     model_matched.vertices = V_arap
