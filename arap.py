@@ -471,6 +471,7 @@ class SymmetricPointToPlane:
         M = scipy.sparse.vstack([self.L_unroll, C])
         return M, d
 
+    # TODO: Use symbolic factorization
     def solve(self,
               V_arap: np.ndarray,
               N_p: np.ndarray,
