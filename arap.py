@@ -204,15 +204,15 @@ def fit_R(cov):
 
 
 @jit
-def fit_cov_SR(e_weight, R_j, alpha):
-    return 2 * alpha * (e_weight[:, None, None] * R_j).sum(0)
+def fit_cov_SR(e_weight, R_j, w_sr):
+    return 2 * w_sr * (e_weight[:, None, None] * R_j).sum(0)
 
 
 @jit
-def fit_cov_surrogate(d, R, n_p, n_q, alpha):
+def fit_cov_surrogate(d, R, n_p, n_q, w_sr):
     d_norm = jnp.linalg.norm(d)
     h = R @ n_p - d * ((n_q + R @ n_p) @ d) / (d_norm**2)
-    return alpha * d_norm**2 * n_p[:, None] @ h[:, None].T
+    return w_sr * d_norm**2 * n_p[:, None] @ h[:, None].T
 
 
 # \sum_{j \in \mathcal{N}(i)} 0.5 * w_{ij} (R_i + R_j) @ (p_i - p_j)
@@ -282,24 +282,24 @@ class AsRigidAsPossible(LinearVertexSolver):
               V_arap: np.ndarray,
               BC: np.ndarray,
               max_iters=8,
-              alpha=1e-5) -> np.ndarray:
+              w_sr=1e-5) -> np.ndarray:
         # Should not save as a class state
         Rs = np.repeat(np.eye(3)[None, ...], len(V_arap), axis=0)
         for _ in range(max_iters):
             # minimize R
-            b, Rs = self.build_arap_rhs(Rs, V_arap, alpha)
+            b, Rs = self.build_arap_rhs(Rs, V_arap, w_sr)
             V_arap = self.solve_(b, BC)
         return V_arap
 
     def build_arap_rhs(self, Rs: np.ndarray, V_arap: np.ndarray,
-                       alpha: float) -> np.ndarray:
+                       w_sr: float) -> np.ndarray:
         Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
 
         cov = vmap(fit_cov)(self.Eij, Eij_, self.E_weight)
         if self.smooth_rotation:
             cov += vmap(fit_cov_SR,
                         in_axes=(0, 0, None))(self.E_weight, Rs[self.E_j],
-                                              alpha * self.A)
+                                              w_sr * self.A)
 
         Rs = vmap(fit_R)(cov)
 
@@ -362,8 +362,7 @@ class SymmetricPointToPlane:
                  b_vid: np.ndarray | None = None,
                  b_fid: np.ndarray | None = None,
                  b_bary_coords: np.ndarray | None = None,
-                 smooth_rotation=True,
-                 w_arap=1):
+                 smooth_rotation=True):
 
         constraints = []
         self.b_v_mask = None
@@ -377,7 +376,6 @@ class SymmetricPointToPlane:
             constraints.append(C_f)
 
         self.C = scipy.sparse.vstack(constraints)
-        self.w_arap = w_arap
 
         # ARAP
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
@@ -427,7 +425,7 @@ class SymmetricPointToPlane:
 
     def build_arap_rhs(self, Rs: np.ndarray, D: np.ndarray, weight: np.ndarray,
                        N_p: np.ndarray, N_q: np.ndarray, V_arap: np.ndarray,
-                       alpha: float):
+                       w_sr: float, w_arap: float):
         Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
 
         # Local
@@ -435,15 +433,15 @@ class SymmetricPointToPlane:
         if self.smooth_rotation:
             cov += vmap(fit_cov_SR,
                         in_axes=(0, 0, None))(self.E_weight, Rs[self.E_j],
-                                              alpha * self.A)
+                                              w_sr * self.A)
         Rs = vmap(fit_R)(cov)
 
         rotvecs = vmap(R3_to_rotvec)(Rs)
         R_p = vmap(rotvec_to_R3)(self.C @ rotvecs)
 
         cov_P = (self.C @ cov.reshape(-1, 9)).reshape(-1, 3, 3)
-        cov_P = self.w_arap * cov_P + vmap(fit_cov_surrogate)(D, R_p, N_p, N_q,
-                                                              weight)
+        cov_P = w_arap * cov_P + vmap(fit_cov_surrogate)(D, R_p, N_p, N_q,
+                                                         weight)
         R_p = vmap(fit_R)(cov_P)
 
         # Update R_s with new R_p, at least for non barycentric ones
@@ -458,7 +456,7 @@ class SymmetricPointToPlane:
 
     def build_global(self, weight, R_p, N_p, Q, N_q):
         W = scipy.sparse.diags(weight)
-        N_sym = np.einsum('bmn,bn->bm', R_p, N_p) - N_q
+        N_sym = np.einsum('bmn,bn->bm', R_p, N_p) + N_q
 
         h, w = self.C.shape
         C_coo = scipy.sparse.coo_array(self.C)
@@ -479,19 +477,20 @@ class SymmetricPointToPlane:
               Q: np.ndarray,
               N_q: np.ndarray,
               max_iters=3,
-              alpha=1e-5):
+              w_arap=1,
+              w_sr=1e-5):
         Rs = np.repeat(np.eye(3)[None, ...], len(V_arap), axis=0)
 
         for _ in range(max_iters):
             P = self.C @ V_arap
             weight = self.build_robust_weight(P, Q)
             b, Rs, R_p = self.build_arap_rhs(Rs, P - Q, weight, N_p, N_q,
-                                             V_arap, alpha)
+                                             V_arap, w_sr, w_arap)
             M, d = self.build_global(weight, R_p, N_p, Q, N_q)
             N_p = np.einsum('bmn,bn->bm', R_p, N_p)
 
             W = scipy.sparse.diags(
-                np.concatenate([self.w_arap * np.ones(len(b)),
+                np.concatenate([w_arap * np.ones(len(b)),
                                 np.ones(len(d))]))
 
             # FIXME: Paper suggests symbolic factorization, not sure how to implement here

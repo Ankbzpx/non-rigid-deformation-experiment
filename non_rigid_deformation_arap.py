@@ -44,7 +44,7 @@ def solve_deform(template: OBJMesh,
                  template_lms,
                  scan_path,
                  scan_lms_path,
-                 use_symmetry=False):
+                 use_symmetry=True):
     scan: trimesh.Trimesh = trimesh.load(scan_path,
                                          process=False,
                                          maintain_order=True)
@@ -107,6 +107,7 @@ def solve_deform(template: OBJMesh,
 
     # ps.init()
     # ps.register_surface_mesh('V_init', V_init, F)
+    # ps.register_surface_mesh('scan', scan.vertices, scan.faces)
     # ps.show()
     # exit()
 
@@ -152,16 +153,19 @@ def solve_deform(template: OBJMesh,
                                               cos_thr=cos_thr)
 
         if use_symmetry:
-            sym_p2p = SymmetricPointToPlane(V,
-                                            F,
-                                            b_vid=B,
-                                            b_fid=lms_fid,
-                                            b_bary_coords=lms_bary_coords,
-                                            w_arap=0.5)
+            sym_p2p = SymmetricPointToPlane(
+                V,
+                F,
+                b_vid=B,
+                b_fid=lms_fid,
+                b_bary_coords=lms_bary_coords,
+            )
 
-            V_arap = sym_p2p.solve(V, np.vstack([N_p, template_lm_normals]),
+            V_arap = sym_p2p.solve(V,
+                                   np.vstack([N_p, template_lm_normals]),
                                    np.vstack([Q, scan_lms]),
-                                   np.vstack([N_q, scan_lms_normals]))
+                                   np.vstack([N_q, scan_lms_normals]),
+                                   w_arap=0.5)
         else:
             arap = AsRigidAsPossible(V_init,
                                      F,
