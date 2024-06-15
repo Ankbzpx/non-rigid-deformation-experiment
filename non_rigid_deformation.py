@@ -95,7 +95,7 @@ def closest_point_triangle_match(verts: torch.Tensor,
     valid_mask = torch.logical_and(dists < dist_thr, cos > cos_thr)
     valid_mask[exclude_indices] = False
 
-    return valid_mask, pt_proj[valid_mask], dists[valid_mask]
+    return valid_mask, pt_proj[valid_mask], dists[valid_mask], indices[valid_mask]
 
 
 if __name__ == '__main__':

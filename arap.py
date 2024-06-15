@@ -4,9 +4,13 @@ import scipy.sparse
 import scipy.sparse.linalg
 import scipy.linalg
 import sparseqr
-from icecream import ic
 import jax.numpy as jnp
+import jax
 from jax import vmap, jit
+from jax.scipy.spatial.transform import Rotation
+
+import polyscope as ps
+from icecream import ic
 
 
 def boundary_condition_bary(V, F, b_fid, b_bary_coords):
@@ -126,9 +130,10 @@ class LinearVertexSolver:
         if self.is_soft:
             M = scipy.sparse.vstack([A[b_mask], C_T])
             M_T = M.T.tocsc()
-            W = scipy.sparse.diags(np.concatenate([V_weight, soft_weight]))
+            W = scipy.sparse.diags(
+                np.concatenate([V_weight[b_mask], soft_weight]))
 
-            self.solve_factorized = scipy.sparse.linalg.factorized(M_T @ M)
+            self.solve_factorized = scipy.sparse.linalg.factorized(M_T @ W @ M)
             self.M_T = M_T
             self.W = W
             self.b_mask = b_mask
@@ -149,7 +154,7 @@ class LinearVertexSolver:
     def solve_(self, b, BC):
         if self.is_soft:
             return self.solve_factorized(
-                self.M_T @ np.vstack([b[self.b_mask], BC]))
+                self.M_T @ self.W @ np.vstack([b[self.b_mask], BC]))
         else:
             d = self.reduce(BC)
             return self.solve_factorized(np.vstack([self.W @ b, d]))[:len(b)]
@@ -181,8 +186,12 @@ class BiLaplacian(LinearVertexSolver):
 
 
 @jit
-def fit_R(eij, eij_, e_weight):
-    cov = eij_.T @ jnp.diag(e_weight) @ eij
+def fit_cov(eij, eij_, e_weight):
+    return eij_.T @ jnp.diag(e_weight) @ eij
+
+
+@jit
+def fit_R(cov):
     U, S, V_T = jnp.linalg.svd(cov)
     R = U @ V_T
 
@@ -191,25 +200,19 @@ def fit_R(eij, eij_, e_weight):
     min_idx = jnp.argmin(S)
     E = E.at[min_idx, min_idx].set(jnp.sign(jnp.linalg.det(R)))
     R = U @ E @ V_T
-
     return R
 
 
 @jit
-def fit_R_SR(eij, eij_, e_weight, R_j, alpha=0.01):
-    cov = eij_.T @ jnp.diag(e_weight) @ eij
-    cov = cov + 2 * alpha * (e_weight[:, None, None] * R_j).sum(0)
+def fit_cov_SR(e_weight, R_j, alpha):
+    return 2 * alpha * (e_weight[:, None, None] * R_j).sum(0)
 
-    U, S, V_T = jnp.linalg.svd(cov)
-    R = U @ V_T
 
-    # Handle reflection
-    E = jnp.eye(len(cov))
-    min_idx = jnp.argmin(S)
-    E = E.at[min_idx, min_idx].set(jnp.sign(jnp.linalg.det(R)))
-    R = U @ E @ V_T
-
-    return R
+@jit
+def fit_cov_surrogate(d, R, n_p, n_q, alpha):
+    d_norm = jnp.linalg.norm(d)
+    h = R @ n_p - d * ((n_q + R @ n_p) @ d) / (d_norm**2)
+    return alpha * d_norm**2 * n_p[:, None] @ h[:, None].T
 
 
 # \sum_{j \in \mathcal{N}(i)} 0.5 * w_{ij} (R_i + R_j) @ (p_i - p_j)
@@ -236,8 +239,7 @@ class AsRigidAsPossible(LinearVertexSolver):
                  smooth_rotation=False):
         L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
         # Negative diagonal
-        A = -L
-        super().__init__(A, V, F, V_weight, b_vid, b_fid, b_bary_coords,
+        super().__init__(-L, V, F, V_weight, b_vid, b_fid, b_bary_coords,
                          soft_weight, soft_exclude)
         # get one-ring neighbour from cotangent matrix
         V_cot_adj_coo = scipy.sparse.coo_array(L)
@@ -275,38 +277,231 @@ class AsRigidAsPossible(LinearVertexSolver):
         self.smooth_rotation = smooth_rotation
         if smooth_rotation:
             self.A = igl.doublearea(V, F).sum() / 2
-            self.Rs = np.repeat(np.eye(3)[None, ...], len(V), axis=0)
 
     def solve(self,
-              BC: np.ndarray,
               V_arap: np.ndarray,
+              BC: np.ndarray,
               max_iters=8,
               alpha=1e-5) -> np.ndarray:
+        # Should not save as a class state
+        Rs = np.repeat(np.eye(3)[None, ...], len(V_arap), axis=0)
         for _ in range(max_iters):
             # minimize R
-            b = self.build_arap_rhs(V_arap, alpha)
+            b, Rs = self.build_arap_rhs(Rs, V_arap, alpha)
             V_arap = self.solve_(b, BC)
         return V_arap
 
-    def build_arap_rhs(self, V_arap: np.ndarray, alpha: float) -> np.ndarray:
+    def build_arap_rhs(self, Rs: np.ndarray, V_arap: np.ndarray,
+                       alpha: float) -> np.ndarray:
         Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
 
+        cov = vmap(fit_cov)(self.Eij, Eij_, self.E_weight)
         if self.smooth_rotation:
-            self.Rs = vmap(fit_R_SR,
-                           in_axes=(0, 0, 0, 0,
-                                    None))(self.Eij, Eij_, self.E_weight,
-                                           self.Rs[self.E_j], alpha * self.A)
-        else:
-            self.Rs = vmap(fit_R)(self.Eij, Eij_, self.E_weight)
+            cov += vmap(fit_cov_SR,
+                        in_axes=(0, 0, None))(self.E_weight, Rs[self.E_j],
+                                              alpha * self.A)
 
-        Rs_i = self.Rs[self.E_i]
-        Rs_j = self.Rs[self.E_j]
+        Rs = vmap(fit_R)(cov)
+
+        Rs_i = Rs[self.E_i]
+        Rs_j = Rs[self.E_j]
         RHS = vmap(arap_rhs)(Rs_i, Rs_j, self.Eij, self.E_weight)
-        return np.asarray(RHS)
+        return np.asarray(RHS), Rs
+
+
+# Replace entries in sparse matrix by coefficient weighted identity blocks
+def unroll_identity_block(A, dim):
+    H, W = A.shape
+    A_coo = scipy.sparse.coo_array(A)
+    A_unroll_row = ((dim * A_coo.row)[..., None] +
+                    np.arange(dim)[None, ...]).reshape(-1)
+    A_unroll_col = ((dim * A_coo.col)[..., None] +
+                    np.arange(dim)[None, ...]).reshape(-1)
+    A_unroll_data = np.repeat(A_coo.data, dim)
+
+    return scipy.sparse.csc_array((A_unroll_data, (A_unroll_row, A_unroll_col)),
+                                  shape=(dim * H, dim * W))
+
+
+@jit
+def R3_to_rotvec(R):
+    return Rotation.from_matrix(R).as_rotvec()
+
+
+@jit
+def skew_symmetric3(rotvec):
+    return jnp.array([[0, -rotvec[2], rotvec[1]], [rotvec[2], 0, -rotvec[0]],
+                      [-rotvec[1], rotvec[0], 0]])
+
+
+@jit
+def rotvec_to_R3_Rodrigues(rotvec):
+    rotvec_norm = jnp.linalg.norm(rotvec)
+    A = skew_symmetric3(rotvec / rotvec_norm)
+    return jnp.eye(
+        3) + jnp.sin(rotvec_norm) * A + (1 - jnp.cos(rotvec_norm)) * A @ A
+
+
+# First order approximation
+@jit
+def rotvec_to_R3_approx(rotvec):
+    return jnp.eye(3) + skew_symmetric3(rotvec)
+
+
+@jit
+def rotvec_to_R3(rotvec):
+    return Rotation.from_rotvec(rotvec).as_matrix()
+
+
+# https://arxiv.org/pdf/2405.20188
+class SymmetricPointToPlane:
+
+    def __init__(self,
+                 V: np.ndarray,
+                 F: np.ndarray,
+                 b_vid: np.ndarray | None = None,
+                 b_fid: np.ndarray | None = None,
+                 b_bary_coords: np.ndarray | None = None,
+                 smooth_rotation=True,
+                 w_arap=1):
+
+        constraints = []
+        self.b_v_mask = None
+        if b_vid is not None:
+            C_v, b_mask = boundary_condition(V, b_vid)
+            self.b_v_mask = np.logical_not(b_mask)
+            constraints.append(C_v)
+
+        if b_fid is not None:
+            C_f, _ = boundary_condition_bary(V, F, b_fid, b_bary_coords)
+            constraints.append(C_f)
+
+        self.C = scipy.sparse.vstack(constraints)
+        self.w_arap = w_arap
+
+        # ARAP
+        L: scipy.sparse.csc_matrix = igl.cotmatrix(V, F)
+        self.L_unroll = unroll_identity_block(-L, 3)
+
+        # get one-ring neighbour from cotangent matrix
+        V_cot_adj_coo = scipy.sparse.coo_array(L)
+        valid_entries_mask = V_cot_adj_coo.col != V_cot_adj_coo.row
+        # col major
+        E_i = V_cot_adj_coo.col[valid_entries_mask]
+        E_j = V_cot_adj_coo.row[valid_entries_mask]
+        E_weight = V_cot_adj_coo.data[valid_entries_mask]
+        E_unique, E_count = np.unique(E_i, return_counts=True)
+        assert (E_unique != np.arange(len(V))).sum() == 0
+        split_indices = np.cumsum(E_count)[:-1]
+
+        E_i_list = np.split(E_i, split_indices)
+        E_j_list = np.split(E_j, split_indices)
+        E_weight_list = np.split(E_weight, split_indices)
+
+        # pad so it can be vmapped
+        pad_width = np.max(E_count)
+
+        def pad_list_of_array(list_of_array):
+            return np.array([
+                np.concatenate([el, np.zeros(pad_width - len(el))])
+                for el in list_of_array
+            ])
+
+        E_i = pad_list_of_array(E_i_list).astype(np.int64)
+        E_j = pad_list_of_array(E_j_list).astype(np.int64)
+        E_weight = pad_list_of_array(E_weight_list)
+
+        self.Eij = jnp.array(V[E_i] - V[E_j])
+        self.E_i = E_i
+        self.E_j = E_j
+        self.E_weight = jnp.array(E_weight)
+
+        self.smooth_rotation = smooth_rotation
+        self.A = igl.doublearea(V, F).sum() / 2
+
+    def build_robust_weight(self, P, Q):
+        D = P - Q
+        dists = np.linalg.norm(D, axis=1)
+        sigma = np.median(dists)
+        return np.exp(-(dists**2) / (2 * sigma**2))
+
+    def build_arap_rhs(self, Rs: np.ndarray, D: np.ndarray, weight: np.ndarray,
+                       N_p: np.ndarray, N_q: np.ndarray, V_arap: np.ndarray,
+                       alpha: float):
+        Eij_ = jnp.array(V_arap[self.E_i] - V_arap[self.E_j])
+
+        # Local
+        cov = vmap(fit_cov)(self.Eij, Eij_, self.E_weight)
+        if self.smooth_rotation:
+            cov += vmap(fit_cov_SR,
+                        in_axes=(0, 0, None))(self.E_weight, Rs[self.E_j],
+                                              alpha * self.A)
+        Rs = vmap(fit_R)(cov)
+
+        rotvecs = vmap(R3_to_rotvec)(Rs)
+        R_p = vmap(rotvec_to_R3)(self.C @ rotvecs)
+
+        cov_P = (self.C @ cov.reshape(-1, 9)).reshape(-1, 3, 3)
+        cov_P = self.w_arap * cov_P + vmap(fit_cov_surrogate)(D, R_p, N_p, N_q,
+                                                              weight)
+        R_p = vmap(fit_R)(cov_P)
+
+        # Update R_s with new R_p, at least for non barycentric ones
+        if self.b_v_mask is not None:
+            b_v_count = self.b_v_mask.sum()
+            Rs = Rs.at[self.b_v_mask].set(R_p[:b_v_count])
+
+        Rs_i = Rs[self.E_i]
+        Rs_j = Rs[self.E_j]
+        RHS = vmap(arap_rhs)(Rs_i, Rs_j, self.Eij, self.E_weight)
+        return np.asarray(RHS).reshape(-1), Rs, R_p
+
+    def build_global(self, weight, R_p, N_p, Q, N_q):
+        W = scipy.sparse.diags(weight)
+        N_sym = np.einsum('bmn,bn->bm', R_p, N_p) - N_q
+
+        h, w = self.C.shape
+        C_coo = scipy.sparse.coo_array(self.C)
+        N_row = np.repeat(C_coo.row, 3)
+        N_col = ((3 * C_coo.col)[..., None] +
+                 np.arange(3)[None, ...]).reshape(-1)
+        N_data = np.repeat(C_coo.data, 3) * N_sym[C_coo.row].reshape(-1)
+        N = scipy.sparse.csc_array((N_data, (N_row, N_col)), shape=(h, 3 * w))
+        C = W @ N
+        d = W @ np.einsum('bn,bn->b', N_sym, Q)
+
+        M = scipy.sparse.vstack([self.L_unroll, C])
+        return M, d
+
+    def solve(self,
+              V_arap: np.ndarray,
+              N_p: np.ndarray,
+              Q: np.ndarray,
+              N_q: np.ndarray,
+              max_iters=3,
+              alpha=1e-5):
+        Rs = np.repeat(np.eye(3)[None, ...], len(V_arap), axis=0)
+
+        for _ in range(max_iters):
+            P = self.C @ V_arap
+            weight = self.build_robust_weight(P, Q)
+            b, Rs, R_p = self.build_arap_rhs(Rs, P - Q, weight, N_p, N_q,
+                                             V_arap, alpha)
+            M, d = self.build_global(weight, R_p, N_p, Q, N_q)
+            N_p = np.einsum('bmn,bn->bm', R_p, N_p)
+
+            W = scipy.sparse.diags(
+                np.concatenate([self.w_arap * np.ones(len(b)),
+                                np.ones(len(d))]))
+
+            # FIXME: Paper suggests symbolic factorization, not sure how to implement here
+            V_arap = scipy.sparse.linalg.spsolve(
+                M.T @ W @ M, M.T @ W @ np.concatenate([b, d])).reshape(-1, 3)
+
+        return V_arap
 
 
 if __name__ == '__main__':
-    import polyscope as ps
     from scipy.spatial.transform import Rotation
     from mesh_helper import read_obj
 
@@ -352,14 +547,14 @@ if __name__ == '__main__':
                              F,
                              b_fid=boundary_fid,
                              b_bary_coords=bary_coords)
-    V_arap = arap.solve(BC, V_init)
+    V_arap = arap.solve(V_init, BC)
 
     sr_arap = AsRigidAsPossible(V,
                                 F,
                                 b_fid=boundary_fid,
                                 b_bary_coords=bary_coords,
                                 smooth_rotation=True)
-    V_sr_arap = sr_arap.solve(BC, V_init)
+    V_sr_arap = sr_arap.solve(V_init, BC)
 
     ps.init()
     ps.register_surface_mesh('bar', V, F, enabled=False)
