@@ -95,7 +95,7 @@ def solve_deform(template: OBJMesh,
         V_init = sym_p2p.solve(V, template_lm_normals, scan_lms,
                                scan_lms_normals)
     else:
-        # Because we project the scan lms, it is point to plane distance
+        # In this case, it is point to point distance
         arap = AsRigidAsPossible(V,
                                  F,
                                  b_fid=lms_fid,
@@ -154,14 +154,14 @@ def solve_deform(template: OBJMesh,
 
         if use_symmetry:
             sym_p2p = SymmetricPointToPlane(
-                V,
+                V_init,
                 F,
                 b_vid=B,
                 b_fid=lms_fid,
                 b_bary_coords=lms_bary_coords,
             )
 
-            V_arap = sym_p2p.solve(V,
+            V_arap = sym_p2p.solve(V_arap,
                                    np.vstack([N_p, template_lm_normals]),
                                    np.vstack([Q, scan_lms]),
                                    np.vstack([N_q, scan_lms_normals]),
