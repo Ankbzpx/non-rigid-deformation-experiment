@@ -478,13 +478,15 @@ class SymmetricPointToPlane:
               Q: np.ndarray,
               N_q: np.ndarray,
               max_iters=3,
+              robust_weight=True,
               w_arap=1,
               w_sr=1e-5):
         Rs = np.repeat(np.eye(3)[None, ...], len(V_arap), axis=0)
 
         for _ in range(max_iters):
             P = self.C @ V_arap
-            weight = self.build_robust_weight(P, Q)
+            weight = self.build_robust_weight(
+                P, Q) if robust_weight else 1.0 * np.ones(len(Q))
             b, Rs, R_p = self.build_arap_rhs(Rs, P - Q, weight, N_p, N_q,
                                              V_arap, w_sr, w_arap)
             M, d = self.build_global(weight, R_p, N_p, Q, N_q)

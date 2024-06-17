@@ -87,23 +87,23 @@ def solve_deform(template: OBJMesh,
     # The scan mesh is sufficiently dense, use its face normals instead
     scan_lms_normals = scan.face_normals[f_indices.detach().cpu().numpy()]
 
-    if use_symmetry:
-        sym_p2p = SymmetricPointToPlane(V,
-                                        F,
-                                        b_fid=lms_fid,
-                                        b_bary_coords=lms_bary_coords)
-        V_init = sym_p2p.solve(V, template_lm_normals, scan_lms,
-                               scan_lms_normals)
-    else:
-        # In this case, it is point to point distance
-        arap = AsRigidAsPossible(V,
-                                 F,
-                                 b_fid=lms_fid,
-                                 b_bary_coords=lms_bary_coords,
-                                 smooth_rotation=True,
-                                 soft_weight=1,
-                                 soft_exclude=False)
-        V_init = arap.solve(V, scan_lms)
+    # if use_symmetry:
+    #     sym_p2p = SymmetricPointToPlane(V,
+    #                                     F,
+    #                                     b_fid=lms_fid,
+    #                                     b_bary_coords=lms_bary_coords)
+    #     V_init = sym_p2p.solve(V, template_lm_normals, scan_lms,
+    #                            scan_lms_normals)
+    # else:
+    # In this case, it is point to point distance
+    arap = AsRigidAsPossible(V,
+                             F,
+                             b_fid=lms_fid,
+                             b_bary_coords=lms_bary_coords,
+                             smooth_rotation=True,
+                             soft_weight=1,
+                             soft_exclude=False)
+    V_init = arap.solve(V, scan_lms)
 
     # ps.init()
     # ps.register_surface_mesh('V_init', V_init, F)
@@ -140,9 +140,10 @@ def solve_deform(template: OBJMesh,
         N_q = scan.face_normals[f_indices.detach().cpu().numpy()]
         return B, N_p, Q, N_q, dist_closest
 
-    max_iter = 20
-    dist_thrs = np.linspace(50 * dist_thr_median, dist_thr_median, max_iter)
-    cos_thrs = np.linspace(0.5, 0.95, max_iter)
+    max_iter = 10
+    dist_thrs = np.linspace(50 * dist_thr_median, 25 * dist_thr_median,
+                            max_iter)
+    cos_thrs = np.linspace(0.5, 0.75, max_iter)
 
     V_arap = V_init
     for i in tqdm(range(max_iter)):
@@ -153,21 +154,16 @@ def solve_deform(template: OBJMesh,
                                               cos_thr=cos_thr)
 
         if use_symmetry:
-            sym_p2p = SymmetricPointToPlane(
-                V_init,
-                F,
-                b_vid=B,
-                b_fid=lms_fid,
-                b_bary_coords=lms_bary_coords,
-            )
-
+            sym_p2p = SymmetricPointToPlane(V, F, b_vid=B)
             V_arap = sym_p2p.solve(V_arap,
-                                   np.vstack([N_p, template_lm_normals]),
-                                   np.vstack([Q, scan_lms]),
-                                   np.vstack([N_q, scan_lms_normals]),
-                                   w_arap=0.5)
+                                   N_p,
+                                   Q,
+                                   N_q,
+                                   robust_weight=False,
+                                   w_arap=1,
+                                   w_sr=1e-4)
         else:
-            arap = AsRigidAsPossible(V_init,
+            arap = AsRigidAsPossible(V,
                                      F,
                                      b_vid=B,
                                      b_fid=lms_fid,
@@ -181,10 +177,6 @@ def solve_deform(template: OBJMesh,
         # ps.register_surface_mesh('V_arap', V_arap, F)
         # ps.register_surface_mesh('scan', scan.vertices, scan.faces)
         # ps.show()
-
-        # good enough...
-        if i == 2:
-            break
 
     model_matched = copy.deepcopy(template)
     model_matched.vertices = V_arap
