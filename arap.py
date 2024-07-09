@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import jax
 from jax import vmap, jit
 from jax.scipy.spatial.transform import Rotation
+from sksparse.cholmod import cholesky_AAt
 
 import polyscope as ps
 from icecream import ic
@@ -483,6 +484,7 @@ class SymmetricPointToPlane:
               w_sr=1e-5):
         Rs = np.repeat(np.eye(3)[None, ...], len(V_arap), axis=0)
 
+        factor = None
         for _ in range(max_iters):
             P = self.C @ V_arap
             weight = self.build_robust_weight(
@@ -492,13 +494,19 @@ class SymmetricPointToPlane:
             M, d = self.build_global(weight, R_p, N_p, Q, N_q)
             N_p = np.einsum('bmn,bn->bm', R_p, N_p)
 
-            W = scipy.sparse.diags(
-                np.concatenate([w_arap * np.ones(len(b)),
-                                np.ones(len(d))]))
+            W_sqrt = scipy.sparse.diags(
+                np.concatenate(
+                    [np.sqrt(w_arap) * np.ones(len(b)),
+                     np.ones(len(d))]))
+            A = (M.T @ W_sqrt).tocsc()
 
-            # FIXME: Paper suggests symbolic factorization, not sure how to implement here
-            V_arap = scipy.sparse.linalg.spsolve(
-                M.T @ W @ M, M.T @ W @ np.concatenate([b, d])).reshape(-1, 3)
+            if factor is None:
+                factor = cholesky_AAt(A)
+            else:
+                # Symbolic factorization
+                factor.cholesky_AAt_inplace(A)
+
+            V_arap = factor(A @ W_sqrt @ np.concatenate([b, d])).reshape(-1, 3)
 
         return V_arap
 
