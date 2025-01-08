@@ -4,7 +4,7 @@ import json
 import numpy as np
 
 from mesh_helper import OBJMesh, write_obj, OBJMesh
-from arap import AsRigidAsPossible
+from arap import AsRigidAsPossible, SymmetricPointToPlane
 import torch
 from non_rigid_deformation import closest_point_triangle_match, closest_point_on_triangle
 import trimesh
@@ -18,6 +18,22 @@ import pickle
 # Debug
 import polyscope as ps
 from icecream import ic
+
+
+# Remove unreference vertices and assign new vertex indices
+def rm_unref_vertices(V, F):
+    V_unique, V_unique_idx, V_unique_idx_inv = np.unique(F.flatten(),
+                                                         return_index=True,
+                                                         return_inverse=True)
+    V_id_new = np.arange(len(V_unique))
+    V_map = V_id_new[np.argsort(V_unique_idx)]
+    V_map_inv = np.zeros((np.max(V_map) + 1,), dtype=np.int64)
+    V_map_inv[V_map] = V_id_new
+
+    F = V_map_inv[V_unique_idx_inv].reshape(F.shape)
+    V = V[V_unique][V_map]
+
+    return V, F
 
 
 def load_template(flame_path, flame_mediapipe_lm_path):
@@ -72,8 +88,14 @@ def deformation_gradient(V, V_deform, F):
     return J
 
 
-def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
-                 landmark_indices, scan_path, scan_lms_path):
+def solve_deform(template: OBJMesh,
+                 lms_fid,
+                 lms_bary_coords,
+                 template_lms,
+                 landmark_indices,
+                 scan_path,
+                 scan_lms_path,
+                 use_symmetry=True):
     scan: trimesh.Trimesh = trimesh.load(scan_path,
                                          process=False,
                                          maintain_order=True)
@@ -87,6 +109,27 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
     V = s * template.vertices @ R.T + t
     F = template.faces
 
+    # Remove disconnected components
+    A = igl.adjacency_matrix(F)
+    n, C, K = igl.connected_components(A)
+    c_idx = np.argmax(K)
+
+    # Remap indices
+    V_rm_mask = np.ones(len(V))
+    V_rm_mask[C != c_idx] = 0
+    F_keep_mask = V_rm_mask[F].sum(1) == 3
+
+    f_map = -np.ones(len(F)).astype(np.int64)
+    f_map[F_keep_mask] = np.arange(F_keep_mask.sum())
+
+    V, F = rm_unref_vertices(V, F[F_keep_mask])
+    lms_fid = f_map[lms_fid]
+    VN = igl.per_vertex_normals(V, F)
+
+    # Use barycentric interpolated vertex normal for lm normals
+    template_lm = (lms_bary_coords[..., None] * V[F][lms_fid]).sum(1)
+    template_lm_normals = (lms_bary_coords[..., None] * VN[F][lms_fid]).sum(1)
+
     NV = len(V)
     NF = len(F)
 
@@ -95,37 +138,30 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
     face_normals_scan = torch.from_numpy(np.copy(
         scan.face_normals)).float().cuda()
 
-    scan_lms = closest_point_on_triangle(
+    pt_proj, _, f_indices = closest_point_on_triangle(
         torch.from_numpy(scan_lms).float().cuda(), per_face_verts_scan,
-        face_normals_scan)[0].detach().cpu().numpy()
+        face_normals_scan)
+    scan_lms = pt_proj.detach().cpu().numpy()
+    # The scan mesh is sufficiently dense, use its face normals instead
+    scan_lms_normals = scan.face_normals[f_indices.detach().cpu().numpy()]
 
-    # 3929
-    eyeball_center_l_idx = 3929
-    eyeball_center_r_idx = 3930
-
-    # 546
-    eyeball_l_idx = 3931
-    eyeball_r_idx = 3931 + 546
-
-    B_eyeball = np.arange(eyeball_l_idx, eyeball_r_idx + 546)
-    BC_eyeball = V[B_eyeball]
-
-    eyeball_l_offset = V[eyeball_l_idx:eyeball_r_idx] - V[eyeball_center_l_idx][
-        None, :]
-    eyeball_r_offset = V[eyeball_r_idx:] - V[eyeball_center_r_idx][None, :]
-
-    # Ignore isolated eyeballs
-    exclude_indices = B_eyeball
-
-    arap = AsRigidAsPossible(V,
-                             F,
-                             b_vid=B_eyeball,
-                             b_fid=lms_fid,
-                             b_bary_coords=lms_bary_coords)
-    V_arap = arap.solve(np.vstack([BC_eyeball, scan_lms]), V)
+    if use_symmetry:
+        sym_p2p = SymmetricPointToPlane(V,
+                                        F,
+                                        b_fid=lms_fid,
+                                        b_bary_coords=lms_bary_coords)
+        V_init = sym_p2p.solve(V, template_lm_normals, scan_lms,
+                               scan_lms_normals)
+    else:
+        arap = AsRigidAsPossible(V,
+                                 F,
+                                 b_fid=lms_fid,
+                                 b_bary_coords=lms_bary_coords,
+                                 smooth_rotation=True)
+        V_init = arap.solve(V, scan_lms)
 
     lm_dist = np.linalg.norm(scan_lms - (s * template_lms @ R.T + t), axis=1)
-    dist_thr = np.median(lm_dist)
+    dist_thr_median = np.median(lm_dist)
 
     faces = torch.from_numpy(F).long().cuda()
     VF, NI = igl.vertex_triangle_adjacency(F, NV)
@@ -133,6 +169,7 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
         torch.from_numpy(vf_indices).long().cuda()
         for vf_indices in np.split(VF, NI[1:-1])
     ]
+    exclude_indices = np.array([])
     exclude_indices = torch.from_numpy(exclude_indices).cuda().long()
     closest_match = partial(closest_point_triangle_match,
                             faces=faces,
@@ -141,59 +178,59 @@ def solve_deform(template: OBJMesh, lms_fid, lms_bary_coords, template_lms,
                             target_vertex_normals=face_normals_scan,
                             exclude_indices=exclude_indices)
 
-    def get_closest_match(verts: np.ndarray, dist_thr=dist_thr, cos_thr=0.0):
-        valid_mask, pt_matched, dist_closest = closest_match(
+    def get_closest_match(verts: np.ndarray, dist_thr, cos_thr):
+        valid_mask, pt_matched, dist_closest, f_indices = closest_match(
             torch.from_numpy(verts).float().cuda(),
             dist_thr=dist_thr,
             cos_thr=cos_thr)
         B = torch.where(valid_mask)[0].detach().cpu().numpy()
-        BC = pt_matched.detach().cpu().numpy()
-        return B, BC, dist_closest
+        Q = pt_matched.detach().cpu().numpy()
+        N_p = VN[valid_mask.detach().cpu().numpy()]
+        N_q = scan.face_normals[f_indices.detach().cpu().numpy()]
+        return B, N_p, Q, N_q, dist_closest
 
-    max_iter = 20
-    dist_thrs = np.linspace(50 * dist_thr, dist_thr, max_iter)
-    cos_thrs = np.linspace(0.5, 0.95, max_iter)
+    max_iter = 10
+    dist_thrs = np.linspace(50 * dist_thr_median, 25 * dist_thr_median,
+                            max_iter)
+    cos_thrs = np.linspace(0.5, 0.75, max_iter)
 
+    V_arap = V_init
     for i in tqdm(range(max_iter)):
         dist_thr = dist_thrs[i]
         cos_thr = cos_thrs[i]
-        B, BC, dist_closest = get_closest_match(V_arap,
-                                                dist_thr=dist_thr,
-                                                cos_thr=cos_thr)
+        B, N_p, Q, N_q, _ = get_closest_match(V_arap,
+                                              dist_thr=dist_thr,
+                                              cos_thr=cos_thr)
 
-        # ps.init()
-        # ps.register_point_cloud('B', V_arap[B])
-        # ps.register_point_cloud('BC', BC)
-        # ps.show()
-        # exit()
+        if use_symmetry:
+            sym_p2p = SymmetricPointToPlane(V, F, b_vid=B)
+            V_arap = sym_p2p.solve(V_arap,
+                                   N_p,
+                                   Q,
+                                   N_q,
+                                   robust_weight=True,
+                                   w_arap=1,
+                                   w_sr=1e-4)
+        else:
+            arap = AsRigidAsPossible(V,
+                                     F,
+                                     b_vid=B,
+                                     b_fid=lms_fid,
+                                     b_bary_coords=lms_bary_coords,
+                                     soft_weight=2.0,
+                                     soft_exclude=False,
+                                     smooth_rotation=True)
+            V_arap = arap.solve(V_arap, np.vstack([Q, scan_lms]))
 
-        # Append eyeball
-        B = np.concatenate([B_eyeball, B])
-        BC = np.vstack([BC_eyeball, BC])
-
-        arap = AsRigidAsPossible(V,
-                                 F,
-                                 b_vid=B,
-                                 b_fid=lms_fid,
-                                 b_bary_coords=lms_bary_coords)
-        V_arap = arap.solve(np.vstack([BC, scan_lms]), V_arap)
-
-        # ps.init()
-        # ps.register_surface_mesh('V_arap', V_arap, F)
-        # ps.register_surface_mesh('scan', scan.vertices, scan.faces)
-        # ps.show()
-
-        if i == 2:
-            break
-
-    # Fix eyeballs. Need a better approach
-    V_arap[eyeball_l_idx:eyeball_r_idx] = eyeball_l_offset + V_arap[
-        eyeball_center_l_idx][None, :]
-    V_arap[eyeball_r_idx:] = eyeball_r_offset + V_arap[eyeball_center_r_idx][
-        None, :]
+    ps.init()
+    ps.register_surface_mesh('V_init', V_arap, F)
+    ps.register_surface_mesh('scan', scan.vertices, scan.faces)
+    ps.show()
+    # exit()
 
     model_matched = copy.deepcopy(template)
     model_matched.vertices = V_arap
+    model_matched.faces = F
 
     return model_matched
 

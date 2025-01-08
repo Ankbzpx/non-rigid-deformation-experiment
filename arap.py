@@ -421,8 +421,11 @@ class SymmetricPointToPlane:
     def build_robust_weight(self, P, Q):
         D = P - Q
         dists = np.linalg.norm(D, axis=1)
-        sigma = np.median(dists)
-        return np.exp(-(dists**2) / (2 * sigma**2))
+        sigma = 1.25 * np.median(dists)
+
+        W = np.ones(len(Q))
+        W[dists > sigma] = (sigma / dists)[dists > sigma]
+        return W
 
     def build_arap_rhs(self, Rs: np.ndarray, D: np.ndarray, weight: np.ndarray,
                        N_p: np.ndarray, N_q: np.ndarray, V_arap: np.ndarray,
