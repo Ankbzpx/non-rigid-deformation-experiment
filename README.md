@@ -1,17 +1,16 @@
 # Non-rigid Deformation Experiment
 ## Environment
+
+```
+sudo apt install libsuitesparse-dev
+```
+
 ```
 conda create --name nicp -y python=3.10
 conda activate nicp
 
-# https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md
-conda install -y pytorch=1.13.0 torchvision pytorch-cuda=11.6 -c pytorch -c nvidia
-conda install -y -c fvcore -c iopath -c conda-forge fvcore iopath
-conda install -y pytorch3d -c pytorch3d
-
-yes | pip install polyscope icecream trimesh pillow scipy chumpy
-yes | python -m pip install libigl
-yes | pip install "jax[cpu]"
+pip install jax
+python -m pip install libigl fcpw trimesh scikit-sparse Pillow tqdm icecream polyscope scipy==1.15.0 numpy==1.26.4 sparseqr==1.2.1
 ```
 
 ## Steps
@@ -25,10 +24,6 @@ Match using ARAP + NICP
 python non_rigid_deformation_arap.py
 ```
 
-Match flame template using ARAP + NICP
-```
-python non_rigid_deformation_arap_flame.py
-```
 
 ## Note
 - Models are proprietary hence not included

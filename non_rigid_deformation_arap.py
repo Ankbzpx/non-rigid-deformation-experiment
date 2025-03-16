@@ -5,18 +5,47 @@ import numpy as np
 
 from mesh_helper import read_obj, write_obj, load_face_landmarks, OBJMesh
 from arap import AsRigidAsPossible, SymmetricPointToPlane
-import torch
-from non_rigid_deformation import closest_point_triangle_match, closest_point_on_triangle
+# from non_rigid_deformation import closest_point_triangle_match, closest_point_on_triangle
 import trimesh
 from functools import partial
 from tqdm import tqdm
 from corase_match_svd import match_correspondence
 import copy
 from functools import partial
+import fcpw
 
 # Debug
 import polyscope as ps
 from icecream import ic
+
+
+# TODO: GPU query
+class ClosestPointQueryHelper:
+
+    def __init__(self, V, F):
+        self.scene = fcpw.scene_3D()
+        self.scene.set_object_count(1)
+
+        self.scene.set_object_vertices(V, 0)
+        self.scene.set_object_triangles(F, 0)
+
+        aggregate_type = fcpw.aggregate_type.bvh_surface_area
+        build_vectorized_cpu_bvh = False
+        print_stats = False
+        reduce_memory_footprint = False
+        self.scene.build(aggregate_type, build_vectorized_cpu_bvh, print_stats,
+                         reduce_memory_footprint)
+
+    # TODO: Allow vector max_squared_radius to improve performance
+    def query(self, query_pos, max_squared_radius=np.inf):
+        interactions = fcpw.interaction_3D_list()
+        self.scene.find_closest_points(
+            query_pos, max_squared_radius * np.ones(len(query_pos)),
+            interactions)
+
+        return np.array([i.p for i in interactions
+                        ]), np.array([i.primitive_index for i in interactions
+                                     ]), np.array([i.d for i in interactions])
 
 
 def load_template(template_path, template_lm_path):
@@ -75,17 +104,9 @@ def solve_deform(template: OBJMesh,
             face_groups[13].reshape(-1)
         ]))
 
-    per_face_verts_scan = torch.from_numpy(
-        scan.vertices[scan.faces]).float().cuda()
-    face_normals_scan = torch.from_numpy(np.copy(
-        scan.face_normals)).float().cuda()
-
-    pt_proj, _, f_indices = closest_point_on_triangle(
-        torch.from_numpy(scan_lms).float().cuda(), per_face_verts_scan,
-        face_normals_scan)
-    scan_lms = pt_proj.detach().cpu().numpy()
-    # The scan mesh is sufficiently dense, use its face normals instead
-    scan_lms_normals = scan.face_normals[f_indices.detach().cpu().numpy()]
+    closest_helper = ClosestPointQueryHelper(np.array(scan.vertices),
+                                             np.array(scan.faces))
+    scan_lms, _, _ = closest_helper.query(scan_lms)
 
     # if use_symmetry:
     #     sym_p2p = SymmetricPointToPlane(V,
@@ -114,31 +135,35 @@ def solve_deform(template: OBJMesh,
     lm_dist = np.linalg.norm(scan_lms - (s * template_lms @ R.T + t), axis=1)
     dist_thr_median = np.median(lm_dist)
 
-    VN = igl.per_vertex_normals(V, F)
-    faces = torch.from_numpy(F).long().cuda()
-    VF, NI = igl.vertex_triangle_adjacency(F, len(V))
-    vert_face_adjacency = [
-        torch.from_numpy(vf_indices).long().cuda()
-        for vf_indices in np.split(VF, NI[1:-1])
-    ]
-    exclude_indices = torch.from_numpy(exclude_indices).cuda().long()
-    closest_match = partial(closest_point_triangle_match,
-                            faces=faces,
-                            vert_face_adjacency=vert_face_adjacency,
-                            target_per_face_verts=per_face_verts_scan,
-                            target_vertex_normals=face_normals_scan,
-                            exclude_indices=exclude_indices)
+    face_normals_scan = scan.face_normals
 
-    def get_closest_match(verts: np.ndarray, dist_thr, cos_thr):
-        valid_mask, pt_matched, dist_closest, f_indices = closest_match(
-            torch.from_numpy(verts).float().cuda(),
-            dist_thr=dist_thr,
-            cos_thr=cos_thr)
-        B = torch.where(valid_mask)[0].detach().cpu().numpy()
-        Q = pt_matched.detach().cpu().numpy()
-        N_p = VN[valid_mask.detach().cpu().numpy()]
-        N_q = scan.face_normals[f_indices.detach().cpu().numpy()]
-        return B, N_p, Q, N_q, dist_closest
+    def get_closest_match(V: np.ndarray, dist_thr, cos_thr):
+        V_matched, fid, dist = closest_helper.query(V)
+
+        # Assume full vertices here
+        VN = igl.per_vertex_normals(V, F)
+        VN_matched = face_normals_scan[fid]
+
+        cos = np.einsum('ab,ab->a', VN_matched, VN)
+        valid_mask = (dist < dist_thr) & (cos > cos_thr)
+        valid_mask[exclude_indices] = False
+
+        B = np.where(valid_mask)[0]
+        P = V[valid_mask]
+        N_p = VN[valid_mask]
+        Q = V_matched[valid_mask]
+        N_q = VN_matched[valid_mask]
+
+        # ps.init()
+        # ps.register_point_cloud("P", P).add_vector_quantity("N_p",
+        #                                                     N_p,
+        #                                                     enabled=True)
+        # ps.register_point_cloud("Q", Q).add_vector_quantity("N_q",
+        #                                                     N_q,
+        #                                                     enabled=True)
+        # ps.show()
+
+        return B, N_p, Q, N_q
 
     max_iter = 10
     dist_thrs = np.linspace(50 * dist_thr_median, 25 * dist_thr_median,
@@ -149,9 +174,9 @@ def solve_deform(template: OBJMesh,
     for i in tqdm(range(max_iter)):
         dist_thr = dist_thrs[i]
         cos_thr = cos_thrs[i]
-        B, N_p, Q, N_q, _ = get_closest_match(V_arap,
-                                              dist_thr=dist_thr,
-                                              cos_thr=cos_thr)
+        B, N_p, Q, N_q = get_closest_match(V_arap,
+                                           dist_thr=dist_thr,
+                                           cos_thr=cos_thr)
 
         if use_symmetry:
             sym_p2p = SymmetricPointToPlane(V, F, b_vid=B)
